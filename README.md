@@ -2,6 +2,8 @@
 
 A standalone ESP8266-based data logger for temperature and humidity monitoring with a web-based interface. Built for the Adafruit HUZZAH ESP8266 board with SI7021 sensor, featuring SD card storage, authentication, and real-time data visualization.
 
+![Web Interface Screenshot](screenshot.png)
+
 ## Features
 
 - **Temperature & Humidity Monitoring**: Continuous logging using Adafruit SI7021 sensor
@@ -185,7 +187,8 @@ esp8266-temp-humidity-logger/
 ├── platformio.ini          # PlatformIO configuration
 ├── .gitignore              # Git ignore rules
 ├── LICENSE                 # MIT License
-└── README.md               # This file
+├── README.md               # This file
+└── screenshot.png          # Web interface screenshot
 ```
 
 ## Development
