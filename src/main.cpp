@@ -12,16 +12,155 @@
 #include <mbedtls/sha256.h>
 
 // Hardware objects (SHT85 I2C default address 0x44)
-SHT85 sht(0x44);
+// ESP32-S3 has only 2 I2C peripherals: Wire and Wire1. Sensors 2 and 3 use software I2C
+// (bit-bang) on their own SDA/SCL pairs so all 4 buses work with your existing wiring.
+SHT85 sht(0x44, &Wire);
+SHT85 sht1(0x44, &Wire1);
+
+// ----- Software I2C for SHT85 on buses 3 and 4 (no hardware I2C on ESP32-S3 for bus 2/3) -----
+static uint8_t sht85SoftCrc8(const uint8_t* data, uint8_t len) {
+  const uint8_t POLY = 0x31;
+  uint8_t crc = 0xFF;
+  for (; len; --len) {
+    crc ^= *data++;
+    for (uint8_t i = 8; i; --i)
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ POLY) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+static void softI2CDelay() {
+  delayMicroseconds(3);
+}
+
+static void softI2CSetSda(int pin, int level) {
+  if (level) {
+    pinMode(pin, INPUT);
+  } else {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }
+}
+
+static void softI2CSetScl(int pin, int level) {
+  if (level) {
+    pinMode(pin, INPUT);
+  } else {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }
+}
+
+static int softI2CReadSda(int pin) {
+  pinMode(pin, INPUT);
+  return digitalRead(pin);
+}
+
+static void softI2CStart(int sda, int scl) {
+  softI2CSetSda(sda, 1);
+  softI2CSetScl(scl, 1);
+  softI2CDelay();
+  softI2CSetSda(sda, 0);
+  softI2CDelay();
+  softI2CSetScl(scl, 0);
+}
+
+static void softI2CStop(int sda, int scl) {
+  softI2CSetSda(sda, 0);
+  softI2CDelay();
+  softI2CSetScl(scl, 1);
+  softI2CDelay();
+  softI2CSetSda(sda, 1);
+  softI2CDelay();
+}
+
+static bool softI2CWriteByte(int sda, int scl, uint8_t byte) {
+  for (int i = 7; i >= 0; i--) {
+    softI2CSetSda(sda, (byte >> i) & 1);
+    softI2CDelay();
+    softI2CSetScl(scl, 1);
+    softI2CDelay();
+    softI2CSetScl(scl, 0);
+  }
+  softI2CSetSda(sda, 1);
+  softI2CDelay();
+  softI2CSetScl(scl, 1);
+  softI2CDelay();
+  int ack = !softI2CReadSda(sda);
+  softI2CSetScl(scl, 0);
+  return (bool)ack;
+}
+
+static uint8_t softI2CReadByte(int sda, int scl, bool ack) {
+  uint8_t byte = 0;
+  softI2CSetSda(sda, 1);
+  for (int i = 7; i >= 0; i--) {
+    softI2CSetScl(scl, 1);
+    softI2CDelay();
+    byte = (byte << 1) | (softI2CReadSda(sda) ? 1 : 0);
+    softI2CSetScl(scl, 0);
+  }
+  softI2CSetSda(sda, ack ? 0 : 1);
+  softI2CDelay();
+  softI2CSetScl(scl, 1);
+  softI2CDelay();
+  softI2CSetScl(scl, 0);
+  softI2CSetSda(sda, 1);
+  return byte;
+}
+
+// SHT85 at 0x44 on bit-banged bus (sda, scl). Returns true if read OK; fills temp and hum.
+static bool readSHT85Soft(int sda, int scl, float* temp, float* hum) {
+  const uint8_t addr = 0x44;
+  const uint16_t cmd = 0x2416;  // SHT_MEASUREMENT_FAST
+  pinMode(sda, INPUT);
+  pinMode(scl, INPUT);
+  softI2CStart(sda, scl);
+  if (!softI2CWriteByte(sda, scl, (addr << 1) | 0)) {
+    softI2CStop(sda, scl);
+    return false;
+  }
+  if (!softI2CWriteByte(sda, scl, cmd >> 8) || !softI2CWriteByte(sda, scl, cmd & 0xFF)) {
+    softI2CStop(sda, scl);
+    return false;
+  }
+  softI2CStop(sda, scl);
+  delay(5);
+  softI2CStart(sda, scl);
+  if (!softI2CWriteByte(sda, scl, (addr << 1) | 1)) {
+    softI2CStop(sda, scl);
+    return false;
+  }
+  uint8_t buf[6];
+  for (int i = 0; i < 6; i++)
+    buf[i] = softI2CReadByte(sda, scl, (i < 5));
+  softI2CStop(sda, scl);
+  if (buf[2] != sht85SoftCrc8(buf, 2) || buf[5] != sht85SoftCrc8(buf + 3, 2)) {
+    return false;
+  }
+  uint16_t rawT = (uint16_t)buf[0] << 8 | buf[1];
+  uint16_t rawH = (uint16_t)buf[3] << 8 | buf[4];
+  *temp = rawT * (175.0f / 65535.0f) - 45.0f;
+  *hum = rawH * (100.0f / 65535.0f);
+  return true;
+}
+static const int NUM_SENSORS = 4;
 RTC_PCF8523 rtc;
 bool rtcPresent = false;
-bool sensorPresent = false;
+bool sensorPresent[4] = { false, false, false, false };
+#define sensorPresentAny() (sensorPresent[0] || sensorPresent[1] || sensorPresent[2] || sensorPresent[3])
 
 // FireBeetle 2 ESP32-S3: onboard LED = GPIO 21 (D13), I2C default SDA=1 SCL=2, SD_CS=9
 #define LED_PIN 21
 #define SD_CS 9
 #define I2C_SDA 1
 #define I2C_SCL 2
+#define I2C1_SDA 4
+#define I2C1_SCL 5
+#define I2C2_SDA 6
+#define I2C2_SCL 8
+#define I2C3_SDA 10
+#define I2C3_SCL 11
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 3000; // 3 seconds
 
@@ -37,11 +176,15 @@ struct Config {
   String ap_password = "logger123";
   String auth_hash;
   String auth_salt;
-  uint32_t sample_period_s = 3600;
+  uint32_t sample_period_s = 3600;        // legacy; use sample_period_sensor[0] when per-sensor
+  uint32_t sample_period_sensor[4] = { 3600, 3600, 3600, 3600 };
   int32_t log_timezone_offset_min = 0;
   String file_rotation = "monthly";
   bool time_set = false;
-  String heating_mode = "off";
+  String heating_mode = "off";            // legacy; use heating_mode_sensor[0] for S0 heater
+  String heating_mode_sensor[4] = { "off", "off", "off", "off" };
+  uint32_t heating_duration_sensor[4] = { 0, 0, 0, 0 };   // seconds heater on (0 = off)
+  uint32_t heating_interval_sensor[4] = { 0, 0, 0, 0 };   // seconds between cycles (0 = off)
 } config;
 
 // Session management
@@ -53,14 +196,18 @@ AuthSession authSessions[10];
 int sessionCount = 0;
 const unsigned long SESSION_TIMEOUT = 3600000; // 1 hour
 
-// Sampling
+// Sampling (per-sensor intervals)
 unsigned long lastSampleTime = 0;
+unsigned long lastReadTime[4] = { 0, 0, 0, 0 };
+float lastT[4] = { NAN, NAN, NAN, NAN };
+float lastH[4] = { NAN, NAN, NAN, NAN };
 bool sdPresent = false;
 uint32_t writeErrors = 0;
 
 // SHT85 heater state machine (non-blocking)
 bool heaterActive = false;           // true while heater is on
-unsigned long heaterStartMs = 0;    // when current heating started
+unsigned long heaterStartMs = 0;    // when current heating cycle started
+unsigned long heaterLastRetriggerMs = 0;  // when heatOn() was last called (for re-trigger)
 unsigned long lastHeaterCycleEndMs = 0;  // when last heating cycle ended
 
 // LittleFS ring-buffer settings (match larger partition; was 256 KB)
@@ -70,6 +217,8 @@ unsigned long lastHeaterCycleEndMs = 0;  // when last heating cycle ended
 #ifndef LFS_RING_RECORD_LEN_DEFAULT
 #define LFS_RING_RECORD_LEN_DEFAULT 96
 #endif
+#define LFS_RING_RECORD_LEN_EXT 128  // 4-sensor format (timestamp,device_id,t0,h0,t1,h1,t2,h2,t3,h3)
+#define LFS_RING_RECORD_LEN_SPARSE 48  // RB2: one record per sensor read (timestamp,sensor_id,t,h)
 const size_t LFS_RING_MAX_BYTES = LFS_RING_MAX_BYTES_DEFAULT;
 const size_t LFS_RING_RECORD_LEN = LFS_RING_RECORD_LEN_DEFAULT;
 
@@ -265,6 +414,85 @@ bool loadConfig() {
     config.heating_mode = (p && p[0]) ? String(p) : "off";
   }
   config.sample_period_s = doc["sample_period_s"] | 3600;
+  if (doc["sample_period_sensor"].is<JsonArray>() && doc["sample_period_sensor"].size() >= 4) {
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t v = doc["sample_period_sensor"][i] | 3600;
+      if (v < 10) v = 10;
+      if (v > 604800) v = 604800;
+      config.sample_period_sensor[i] = v;
+    }
+    config.sample_period_s = config.sample_period_sensor[0];
+  } else {
+    uint32_t single = config.sample_period_s;
+    if (single < 10) single = 10;
+    if (single > 604800) single = 604800;
+    for (size_t i = 0; i < 4; i++) config.sample_period_sensor[i] = single;
+  }
+  // Heating: new duration/interval or legacy mode_sensor
+  if (doc["heating_duration_sensor"].is<JsonArray>() && doc["heating_interval_sensor"].is<JsonArray>() &&
+      doc["heating_duration_sensor"].size() >= 4 && doc["heating_interval_sensor"].size() >= 4) {
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t interval = doc["heating_interval_sensor"][i] | 0;
+      uint32_t duration = doc["heating_duration_sensor"][i] | 0;
+      if (interval == 0) duration = 0;
+      else if (duration > interval) duration = interval;
+      config.heating_interval_sensor[i] = interval;
+      config.heating_duration_sensor[i] = duration;
+    }
+    // Derive legacy mode for compatibility
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t d = config.heating_duration_sensor[i];
+      uint32_t inv = config.heating_interval_sensor[i];
+      if (inv == 0) config.heating_mode_sensor[i] = "off";
+      else if (d == 10 && inv == 300) config.heating_mode_sensor[i] = "10s_5min";
+      else if (d == 60 && inv == 3600) config.heating_mode_sensor[i] = "1min_1hr";
+      else if (d == 60 && inv == 86400) config.heating_mode_sensor[i] = "1min_1day";
+      else config.heating_mode_sensor[i] = "off";
+    }
+    config.heating_mode = config.heating_mode_sensor[0];
+  } else if (doc["heating_mode_sensor"].is<JsonArray>() && doc["heating_mode_sensor"].size() >= 4) {
+    for (size_t i = 0; i < 4; i++) {
+      const char* m = doc["heating_mode_sensor"][i].as<const char*>();
+      if (m && (String(m) == "off" || String(m) == "10s_5min" || String(m) == "1min_1hr" || String(m) == "1min_1day")) {
+        config.heating_mode_sensor[i] = String(m);
+      } else {
+        config.heating_mode_sensor[i] = "off";
+      }
+      // Derive duration/interval from mode
+      if (config.heating_mode_sensor[i] == "10s_5min") {
+        config.heating_duration_sensor[i] = 10;
+        config.heating_interval_sensor[i] = 300;
+      } else if (config.heating_mode_sensor[i] == "1min_1hr") {
+        config.heating_duration_sensor[i] = 60;
+        config.heating_interval_sensor[i] = 3600;
+      } else if (config.heating_mode_sensor[i] == "1min_1day") {
+        config.heating_duration_sensor[i] = 60;
+        config.heating_interval_sensor[i] = 86400;
+      } else {
+        config.heating_duration_sensor[i] = 0;
+        config.heating_interval_sensor[i] = 0;
+      }
+    }
+    config.heating_mode = config.heating_mode_sensor[0];
+  } else {
+    config.heating_mode_sensor[0] = config.heating_mode;
+    for (size_t i = 1; i < 4; i++) config.heating_mode_sensor[i] = "off";
+    for (size_t i = 0; i < 4; i++) {
+      if (config.heating_mode_sensor[i] == "10s_5min") {
+        config.heating_duration_sensor[i] = 10;
+        config.heating_interval_sensor[i] = 300;
+      } else if (config.heating_mode_sensor[i] == "1min_1hr") {
+        config.heating_duration_sensor[i] = 60;
+        config.heating_interval_sensor[i] = 3600;
+      } else if (config.heating_mode_sensor[i] == "1min_1day") {
+        config.heating_duration_sensor[i] = 60;
+        config.heating_interval_sensor[i] = 86400;
+      } else {
+        config.heating_duration_sensor[i] = 0;
+        config.heating_interval_sensor[i] = 0;
+      }
+    }
+  }
   config.log_timezone_offset_min = doc["log_timezone_offset_min"] | 0;
   config.time_set = doc["time_set"] | false;
   
@@ -279,11 +507,32 @@ bool saveConfig() {
   doc["ap_password"] = config.ap_password;
   doc["auth_hash"] = config.auth_hash;
   doc["auth_salt"] = config.auth_salt;
-  doc["sample_period_s"] = config.sample_period_s;
+  doc["sample_period_s"] = config.sample_period_sensor[0];
+  JsonArray sp = doc.createNestedArray("sample_period_sensor");
+  for (size_t i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
   doc["log_timezone_offset_min"] = config.log_timezone_offset_min;
   doc["file_rotation"] = config.file_rotation;
   doc["time_set"] = config.time_set;
-  doc["heating_mode"] = config.heating_mode;
+  // Derive legacy mode from duration/interval for compatibility
+  for (size_t i = 0; i < 4; i++) {
+    uint32_t d = config.heating_duration_sensor[i];
+    uint32_t inv = config.heating_interval_sensor[i];
+    if (inv == 0) config.heating_mode_sensor[i] = "off";
+    else if (d == 10 && inv == 300) config.heating_mode_sensor[i] = "10s_5min";
+    else if (d == 60 && inv == 3600) config.heating_mode_sensor[i] = "1min_1hr";
+    else if (d == 60 && inv == 86400) config.heating_mode_sensor[i] = "1min_1day";
+    else config.heating_mode_sensor[i] = "off";
+  }
+  config.heating_mode = config.heating_mode_sensor[0];
+  doc["heating_mode"] = config.heating_mode_sensor[0];
+  JsonArray hm = doc.createNestedArray("heating_mode_sensor");
+  for (size_t i = 0; i < 4; i++) hm.add(config.heating_mode_sensor[i]);
+  JsonArray hd = doc.createNestedArray("heating_duration_sensor");
+  JsonArray hi = doc.createNestedArray("heating_interval_sensor");
+  for (size_t i = 0; i < 4; i++) {
+    hd.add(config.heating_duration_sensor[i]);
+    hi.add(config.heating_interval_sensor[i]);
+  }
   
   File file = LittleFS.open("/config.json", "w");
   if (!file) {
@@ -307,10 +556,16 @@ void getDefaultConfig() {
   config.auth_hash = hashPassword(defaultPassword, config.auth_salt);
   
   config.sample_period_s = 3600;
+  for (size_t i = 0; i < 4; i++) config.sample_period_sensor[i] = 3600;
   config.log_timezone_offset_min = 0;
   config.file_rotation = "monthly";
   config.time_set = false;
   config.heating_mode = "off";
+  for (size_t i = 0; i < 4; i++) {
+    config.heating_mode_sensor[i] = "off";
+    config.heating_duration_sensor[i] = 0;
+    config.heating_interval_sensor[i] = 0;
+  }
 }
 
 // Time functions
@@ -362,25 +617,78 @@ String getLogFilenameForMonth(int year, int month) {
   return String(buffer);
 }
 
+// Path for sparse (RB2) writes: use getLogFilename() if new or already RB2; else use ..._s.csv to avoid overwriting RB1
+String getSparseLogPath() {
+  String path = getLogFilename();
+  if (!LittleFS.exists(path)) {
+    return path;
+  }
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    return path;
+  }
+  String magic = f.readStringUntil('\n');
+  f.close();
+  if (magic == "RB2") {
+    return path;
+  }
+  int dot = path.lastIndexOf('.');
+  if (dot > 0) {
+    return path.substring(0, dot) + "_s.csv";
+  }
+  return path + "_s";
+}
+
 void normalizeMonthStart(time_t epoch, int& year, int& month) {
   struct tm* t = gmtime(&epoch);
   year = t->tm_year + 1900;
   month = t->tm_mon + 1;
 }
 
+static const char LFS_RING_HEADER_1SENSOR[] = "H:timestamp,device_id,temperature_c,humidity_rh\n";
+static const char LFS_RING_HEADER_4SENSOR[] = "H:timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n";
+static const char LFS_RING_HEADER_SPARSE[] = "H:timestamp,sensor_id,t_c,h_rh\n";
+
 size_t lfsRingHeaderSize() {
   String header = "RB1\n";
   header += "W:00000000\n";
   header += "C:00000000\n";
-  header += "H:timestamp,device_id,temperature_c,humidity_rh\n";
+  header += LFS_RING_HEADER_1SENSOR;
   return header.length();
 }
 
-size_t lfsRingSlotCount(size_t dataStart) {
-  if (LFS_RING_MAX_BYTES <= dataStart + LFS_RING_RECORD_LEN) {
+size_t lfsRingHeaderSizeExt() {
+  String header = "RB1\n";
+  header += "W:00000000\n";
+  header += "C:00000000\n";
+  header += LFS_RING_HEADER_4SENSOR;
+  return header.length();
+}
+
+size_t lfsRingHeaderSizeSparse() {
+  String header = "RB2\n";
+  header += "W:00000000\n";
+  header += "C:00000000\n";
+  header += LFS_RING_HEADER_SPARSE;
+  return header.length();
+}
+
+void lfsRingWriteHeaderSparse(File& file, unsigned long offset, unsigned long count) {
+  file.seek(0);
+  file.print("RB2\n");
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "W:%08lu\n", offset);
+  file.print(buffer);
+  snprintf(buffer, sizeof(buffer), "C:%08lu\n", count);
+  file.print(buffer);
+  file.print(LFS_RING_HEADER_SPARSE);
+}
+
+size_t lfsRingSlotCount(size_t dataStart, size_t recordLen) {
+  if (LFS_RING_MAX_BYTES <= dataStart + recordLen) {
     return 0;
   }
-  return (LFS_RING_MAX_BYTES - dataStart) / LFS_RING_RECORD_LEN;
+  return (LFS_RING_MAX_BYTES - dataStart) / recordLen;
 }
 
 void lfsRingWriteHeader(File& file, unsigned long offset, unsigned long count) {
@@ -391,10 +699,21 @@ void lfsRingWriteHeader(File& file, unsigned long offset, unsigned long count) {
   file.print(buffer);
   snprintf(buffer, sizeof(buffer), "C:%08lu\n", count);
   file.print(buffer);
-  file.print("H:timestamp,device_id,temperature_c,humidity_rh\n");
+  file.print(LFS_RING_HEADER_1SENSOR);
 }
 
-bool lfsRingReadHeader(File& file, size_t& dataStart, unsigned long& offset, unsigned long& count, size_t& slots) {
+void lfsRingWriteHeaderExt(File& file, unsigned long offset, unsigned long count) {
+  file.seek(0);
+  file.print("RB1\n");
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "W:%08lu\n", offset);
+  file.print(buffer);
+  snprintf(buffer, sizeof(buffer), "C:%08lu\n", count);
+  file.print(buffer);
+  file.print(LFS_RING_HEADER_4SENSOR);
+}
+
+bool lfsRingReadHeader(File& file, size_t& dataStart, unsigned long& offset, unsigned long& count, size_t& slots, size_t& recordLen) {
   file.seek(0);
   String magic = file.readStringUntil('\n');
   if (magic != "RB1") {
@@ -412,11 +731,35 @@ bool lfsRingReadHeader(File& file, size_t& dataStart, unsigned long& offset, uns
   offset = offsetLine.substring(2).toInt();
   count = countLine.substring(2).toInt();
   dataStart = magic.length() + 1 + offsetLine.length() + 1 + countLine.length() + 1 + headerLine.length() + 1;
-  slots = lfsRingSlotCount(dataStart);
+  recordLen = headerLine.indexOf("t1_c") >= 0 ? LFS_RING_RECORD_LEN_EXT : LFS_RING_RECORD_LEN;
+  slots = lfsRingSlotCount(dataStart, recordLen);
   if (slots == 0 || offset >= slots || count > slots) {
     return false;
   }
 
+  return true;
+}
+
+bool lfsRingReadHeaderSparse(File& file, size_t& dataStart, unsigned long& offset, unsigned long& count, size_t& slots, size_t& recordLen) {
+  file.seek(0);
+  String magic = file.readStringUntil('\n');
+  if (magic != "RB2") {
+    return false;
+  }
+  String offsetLine = file.readStringUntil('\n');
+  String countLine = file.readStringUntil('\n');
+  String headerLine = file.readStringUntil('\n');
+  if (!offsetLine.startsWith("W:") || !countLine.startsWith("C:") || !headerLine.startsWith("H:")) {
+    return false;
+  }
+  offset = offsetLine.substring(2).toInt();
+  count = countLine.substring(2).toInt();
+  dataStart = magic.length() + 1 + offsetLine.length() + 1 + countLine.length() + 1 + headerLine.length() + 1;
+  recordLen = LFS_RING_RECORD_LEN_SPARSE;
+  slots = lfsRingSlotCount(dataStart, recordLen);
+  if (slots == 0 || offset >= slots || count > slots) {
+    return false;
+  }
   return true;
 }
 
@@ -435,11 +778,96 @@ String lfsRingTrimRecord(const char* buf, size_t len) {
   return out;
 }
 
-bool writeLfsRingRecord(const String& filename, const String& line) {
-  File file = LittleFS.open(filename, "r+");
-  if (!file) {
-    file = LittleFS.open(filename, "w+");
+// Create empty ring-buffer file with extended header so LittleFS allows creation
+// (open "w+" on missing file can fail with "no permits for creation" on ESP32 VFS)
+static bool lfsEnsureLogFileExists(const String& filename) {
+  File r = LittleFS.open(filename, "r");
+  if (r) {
+    r.close();
+    return true;
   }
+  File w = LittleFS.open(filename, "w");
+  if (!w) {
+    return false;
+  }
+  lfsRingWriteHeaderExt(w, 0, 0);
+  w.close();
+  return true;
+}
+
+static bool lfsEnsureSparseLogFileExists(const String& path) {
+  File r = LittleFS.open(path, "r");
+  if (r) {
+    r.close();
+    return true;
+  }
+  File w = LittleFS.open(path, "w");
+  if (!w) {
+    return false;
+  }
+  lfsRingWriteHeaderSparse(w, 0, 0);
+  w.close();
+  return true;
+}
+
+// Write one sparse record (RB2): timestamp,sensor_id,t,h. Returns true on success.
+static bool writeLfsRingRecordSparse(const String& path, const String& timestamp, int sensorId, float t, float h) {
+  if (!lfsEnsureSparseLogFileExists(path)) {
+    return false;
+  }
+  File file = LittleFS.open(path, "r+");
+  if (!file) {
+    return false;
+  }
+  size_t dataStart = 0;
+  unsigned long offset = 0;
+  unsigned long count = 0;
+  size_t slots = 0;
+  size_t recordLen = LFS_RING_RECORD_LEN_SPARSE;
+  if (!lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)) {
+    file.close();
+    return false;
+  }
+  char buf[LFS_RING_RECORD_LEN_SPARSE + 1];
+  int n = snprintf(buf, sizeof(buf), "%-24s,%d,%6.2f,%6.2f\n",
+                   timestamp.c_str(), sensorId, (double)t, (double)h);
+  if (n < 0 || (size_t)n >= recordLen) {
+    file.close();
+    return false;
+  }
+  while ((size_t)n < recordLen - 1) {
+    buf[n++] = ' ';
+  }
+  buf[recordLen - 1] = '\n';
+  buf[recordLen] = '\0';
+
+  size_t pos = dataStart + (offset * recordLen);
+  file.seek(pos);
+  size_t written = file.print(buf);
+  file.close();
+  if (written != recordLen) {
+    return false;
+  }
+  offset = (offset + 1) % slots;
+  if (count < slots) {
+    count++;
+  }
+  file = LittleFS.open(path, "r+");
+  if (!file) {
+    return true;  // wrote data, only header update failed
+  }
+  lfsRingWriteHeaderSparse(file, offset, count);
+  file.flush();
+  file.close();
+  return true;
+}
+
+bool writeLfsRingRecord(const String& filename, const String& lineShort, const String& lineLong) {
+  if (!lfsEnsureLogFileExists(filename)) {
+    Serial.println("LittleFS could not create log file: " + filename);
+    return false;
+  }
+  File file = LittleFS.open(filename, "r+");
   if (!file) {
     Serial.println("LittleFS file open failed: " + filename);
     return false;
@@ -449,17 +877,25 @@ bool writeLfsRingRecord(const String& filename, const String& line) {
   unsigned long offset = 0;
   unsigned long count = 0;
   size_t slots = 0;
+  size_t recordLen = LFS_RING_RECORD_LEN;
 
-  if (!lfsRingReadHeader(file, dataStart, offset, count, slots)) {
+  if (!lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen)) {
     file.close();
-    file = LittleFS.open(filename, "w+");
+    file = LittleFS.open(filename, "w");
     if (!file) {
       Serial.println("LittleFS file reinit failed: " + filename);
       return false;
     }
-    lfsRingWriteHeader(file, 0, 0);
-    dataStart = lfsRingHeaderSize();
-    slots = lfsRingSlotCount(dataStart);
+    lfsRingWriteHeaderExt(file, 0, 0);
+    file.close();
+    file = LittleFS.open(filename, "r+");
+    if (!file) {
+      Serial.println("LittleFS file reopen failed: " + filename);
+      return false;
+    }
+    dataStart = lfsRingHeaderSizeExt();
+    recordLen = LFS_RING_RECORD_LEN_EXT;
+    slots = lfsRingSlotCount(dataStart, recordLen);
     if (slots == 0) {
       file.close();
       Serial.println("LittleFS ring buffer size too small");
@@ -469,23 +905,25 @@ bool writeLfsRingRecord(const String& filename, const String& line) {
     count = 0;
   }
 
+  String line = (recordLen >= LFS_RING_RECORD_LEN_EXT) ? lineLong : lineShort;
   String record = line;
   if (record.endsWith("\n")) {
     record.remove(record.length() - 1);
   }
-  if (record.length() > LFS_RING_RECORD_LEN - 1) {
-    record = record.substring(0, LFS_RING_RECORD_LEN - 1);
+  size_t maxRec = recordLen - 1;
+  if (record.length() > maxRec) {
+    record = record.substring(0, maxRec);
   }
-  while (record.length() < LFS_RING_RECORD_LEN - 1) {
+  while (record.length() < maxRec) {
     record += " ";
   }
   record += "\n";
 
-  size_t pos = dataStart + (offset * LFS_RING_RECORD_LEN);
+  size_t pos = dataStart + (offset * recordLen);
   file.seek(pos);
   size_t written = file.print(record);
 
-  if (written != LFS_RING_RECORD_LEN) {
+  if (written != recordLen) {
     file.close();
     Serial.println("LittleFS ring write failed");
     return false;
@@ -496,74 +934,47 @@ bool writeLfsRingRecord(const String& filename, const String& line) {
     count++;
   }
 
-  lfsRingWriteHeader(file, offset, count);
+  if (recordLen >= LFS_RING_RECORD_LEN_EXT) {
+    lfsRingWriteHeaderExt(file, offset, count);
+  } else {
+    lfsRingWriteHeader(file, offset, count);
+  }
   file.flush();
   file.close();
   return true;
 }
 
-// Data logging
-bool writeDataPoint(float temperature, float humidity) {
-  String timestamp = getISOTimestamp();
+// Helper: format one value for CSV (NaN if not finite)
+static String fmtVal(float v) {
+  if (!isfinite(v)) return "NaN";
+  return String(v, 2);
+}
+
+// Write one full row to SD (optional): timestamp,device_id,t0,h0,t1,h1,t2,h2,t3,h3. Returns true if written or SD not present.
+static bool writeSDDataPoint(const String& timestamp, float t0, float h0, float t1, float h1, float t2, float h2, float t3, float h3) {
+  if (!sdPresent) return true;
   String filename = getLogFilename();
-  String line = timestamp + "," + config.device_id + "," + 
-                String(temperature, 2) + "," + String(humidity, 2) + "\n";
-  
-  Serial.print("Writing to: ");
-  Serial.println(filename);
-  
-  bool lfsSuccess = false;
-  bool sdSuccess = false;
-  
-  // Ensure /logs/ directory exists on LittleFS
-  if (!LittleFS.exists("/logs")) {
-    LittleFS.mkdir("/logs");
-    Serial.println("Created /logs directory on LittleFS");
+  if (!SD.exists("/logs")) {
+    SD.mkdir("/logs");
   }
-  
-  // Write to LittleFS (primary) using ring-buffer format
-  if (writeLfsRingRecord(filename, line)) {
-      lfsSuccess = true;
+  bool sdExists = SD.exists(filename);
+  File sdFile = SD.open(filename, FILE_WRITE);
+  if (!sdFile) return false;
+  sdFile.seek(sdFile.size());
+  if (!sdExists) {
+    sdFile.print("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
   }
-  
-  // Write to SD (backup)
-  if (sdPresent) {
-    // Ensure /logs/ directory exists on SD
-    if (!SD.exists("/logs")) {
-      SD.mkdir("/logs");
-      Serial.println("Created /logs directory on SD");
-    }
-    
-    bool sdExists = SD.exists(filename);
-    File sdFile = SD.open(filename, FILE_WRITE);
-    if (sdFile) {
-      // Seek to end for append (FILE_WRITE may not auto-append on all platforms)
-      sdFile.seek(sdFile.size());
-      // Write header if file is new
-      if (!sdExists) {
-        sdFile.print("timestamp,device_id,temperature_c,humidity_rh\n");
-      }
-      sdFile.print(line);
-      sdFile.flush();  // Force write to SD
-      sdFile.close();
-      sdSuccess = true;
-    } else {
-      Serial.println("SD file open failed: " + filename);
-    }
-  }
-  
-  if (!lfsSuccess && !sdSuccess) {
-    writeErrors++;
-    Serial.println("BOTH storage writes failed!");
-    return false;
-  }
-  
+  String line = timestamp + "," + config.device_id + "," +
+      fmtVal(t0) + "," + fmtVal(h0) + "," + fmtVal(t1) + "," + fmtVal(h1) + "," +
+      fmtVal(t2) + "," + fmtVal(h2) + "," + fmtVal(t3) + "," + fmtVal(h3) + "\n";
+  sdFile.print(line);
+  sdFile.flush();
+  sdFile.close();
   return true;
 }
 
 size_t estimateSampleBytes() {
-  // Fixed ring-buffer record size
-  return LFS_RING_RECORD_LEN;
+  return LFS_RING_RECORD_LEN_SPARSE;  // sparse: one record per sensor read
 }
 
 // API Handlers
@@ -628,13 +1039,23 @@ void handleApiConfig() {
   // No auth required - WiFi password is sufficient
   
   if (server.method() == HTTP_GET) {
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(768);
     doc["device_id"] = config.device_id;
-    doc["sample_period_s"] = config.sample_period_s;
+    doc["sample_period_s"] = config.sample_period_sensor[0];
+    JsonArray sp = doc.createNestedArray("sample_period_sensor");
+    for (size_t i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
     doc["log_timezone_offset_min"] = config.log_timezone_offset_min;
     doc["file_rotation"] = config.file_rotation;
     doc["time_set"] = config.time_set;
-    doc["heating_mode"] = config.heating_mode;
+    doc["heating_mode"] = config.heating_mode_sensor[0];
+    JsonArray hm = doc.createNestedArray("heating_mode_sensor");
+    for (size_t i = 0; i < 4; i++) hm.add(config.heating_mode_sensor[i]);
+    JsonArray hd = doc.createNestedArray("heating_duration_sensor");
+    JsonArray hi = doc.createNestedArray("heating_interval_sensor");
+    for (size_t i = 0; i < 4; i++) {
+      hd.add(config.heating_duration_sensor[i]);
+      hi.add(config.heating_interval_sensor[i]);
+    }
     
     String response;
     serializeJson(doc, response);
@@ -652,9 +1073,18 @@ void handleApiConfig() {
       return;
     }
     
-    if (doc.containsKey("sample_period_s")) {
+    if (doc.containsKey("sample_period_sensor") && doc["sample_period_sensor"].is<JsonArray>() && doc["sample_period_sensor"].size() >= 4) {
+      for (size_t i = 0; i < 4; i++) {
+        uint32_t period = doc["sample_period_sensor"][i] | 3600;
+        if (period < 10) period = 10;
+        if (period > 604800) period = 604800;
+        config.sample_period_sensor[i] = period;
+      }
+      config.sample_period_s = config.sample_period_sensor[0];
+    } else if (doc.containsKey("sample_period_s")) {
       uint32_t period = doc["sample_period_s"];
-      if (period >= 10 && period <= 604800) { // 10s to 7 days
+      if (period >= 10 && period <= 604800) {
+        for (size_t i = 0; i < 4; i++) config.sample_period_sensor[i] = period;
         config.sample_period_s = period;
       } else {
         server.send(400, "application/json", "{\"error\":\"Invalid sample period\"}");
@@ -666,13 +1096,71 @@ void handleApiConfig() {
       config.log_timezone_offset_min = doc["log_timezone_offset_min"];
     }
     
-    if (doc.containsKey("heating_mode")) {
+    if (doc.containsKey("heating_duration_sensor") && doc["heating_duration_sensor"].is<JsonArray>() && doc["heating_duration_sensor"].size() >= 4 &&
+        doc.containsKey("heating_interval_sensor") && doc["heating_interval_sensor"].is<JsonArray>() && doc["heating_interval_sensor"].size() >= 4) {
+      for (size_t i = 0; i < 4; i++) {
+        uint32_t interval = doc["heating_interval_sensor"][i] | 0;
+        uint32_t duration = doc["heating_duration_sensor"][i] | 0;
+        if (interval == 0) duration = 0;
+        else if (duration > interval) duration = interval;
+        config.heating_interval_sensor[i] = interval;
+        config.heating_duration_sensor[i] = duration;
+      }
+      for (size_t i = 0; i < 4; i++) {
+        uint32_t d = config.heating_duration_sensor[i];
+        uint32_t inv = config.heating_interval_sensor[i];
+        if (inv == 0) config.heating_mode_sensor[i] = "off";
+        else if (d == 10 && inv == 300) config.heating_mode_sensor[i] = "10s_5min";
+        else if (d == 60 && inv == 3600) config.heating_mode_sensor[i] = "1min_1hr";
+        else if (d == 60 && inv == 86400) config.heating_mode_sensor[i] = "1min_1day";
+        else config.heating_mode_sensor[i] = "off";
+      }
+      config.heating_mode = config.heating_mode_sensor[0];
+    } else if (doc.containsKey("heating_mode_sensor") && doc["heating_mode_sensor"].is<JsonArray>() && doc["heating_mode_sensor"].size() >= 4) {
+      for (size_t i = 0; i < 4; i++) {
+        const char* mode = doc["heating_mode_sensor"][i].as<const char*>();
+        if (mode) {
+          String m = String(mode);
+          if (m == "off" || m == "10s_5min" || m == "1min_1hr" || m == "1min_1day") {
+            config.heating_mode_sensor[i] = m;
+          }
+        }
+        if (config.heating_mode_sensor[i] == "10s_5min") {
+          config.heating_duration_sensor[i] = 10;
+          config.heating_interval_sensor[i] = 300;
+        } else if (config.heating_mode_sensor[i] == "1min_1hr") {
+          config.heating_duration_sensor[i] = 60;
+          config.heating_interval_sensor[i] = 3600;
+        } else if (config.heating_mode_sensor[i] == "1min_1day") {
+          config.heating_duration_sensor[i] = 60;
+          config.heating_interval_sensor[i] = 86400;
+        } else {
+          config.heating_duration_sensor[i] = 0;
+          config.heating_interval_sensor[i] = 0;
+        }
+      }
+      config.heating_mode = config.heating_mode_sensor[0];
+    } else if (doc.containsKey("heating_mode")) {
       const char* mode = doc["heating_mode"].as<const char*>();
       if (mode) {
         String m = String(mode);
         if (m == "off" || m == "10s_5min" || m == "1min_1hr" || m == "1min_1day") {
+          config.heating_mode_sensor[0] = m;
           config.heating_mode = m;
         }
+      }
+      if (config.heating_mode_sensor[0] == "10s_5min") {
+        config.heating_duration_sensor[0] = 10;
+        config.heating_interval_sensor[0] = 300;
+      } else if (config.heating_mode_sensor[0] == "1min_1hr") {
+        config.heating_duration_sensor[0] = 60;
+        config.heating_interval_sensor[0] = 3600;
+      } else if (config.heating_mode_sensor[0] == "1min_1day") {
+        config.heating_duration_sensor[0] = 60;
+        config.heating_interval_sensor[0] = 86400;
+      } else {
+        config.heating_duration_sensor[0] = 0;
+        config.heating_interval_sensor[0] = 0;
       }
     }
     
@@ -838,18 +1326,21 @@ void handleApiPrune() {
 
     size_t originalSize = file.size();
 
-    // Detect ring-buffer format
+    file.seek(0);
+    String magic = file.readStringUntil('\n');
     file.seek(0);
     size_t dataStart = 0;
     unsigned long offset = 0;
     unsigned long count = 0;
     size_t slots = 0;
-    bool isRing = lfsRingReadHeader(file, dataStart, offset, count, slots);
+    size_t recordLen = LFS_RING_RECORD_LEN;
+    bool isSparse = (magic == "RB2");
+    bool isRing = isSparse ? lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)
+                           : lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen);
 
     String tmpName = fileName + ".tmp";
 
     if (isRing) {
-      // Prune ring-buffer file without corrupting the RB1 format.
       File tmp = LittleFS.open(tmpName, "w+");
       if (!tmp) {
         file.close();
@@ -857,9 +1348,15 @@ void handleApiPrune() {
         continue;
       }
 
-      lfsRingWriteHeader(tmp, 0, 0);
-      size_t tmpDataStart = lfsRingHeaderSize();
-      size_t tmpSlots = lfsRingSlotCount(tmpDataStart);
+      if (isSparse) {
+        lfsRingWriteHeaderSparse(tmp, 0, 0);
+      } else if (recordLen >= LFS_RING_RECORD_LEN_EXT) {
+        lfsRingWriteHeaderExt(tmp, 0, 0);
+      } else {
+        lfsRingWriteHeader(tmp, 0, 0);
+      }
+      size_t tmpDataStart = isSparse ? lfsRingHeaderSizeSparse() : ((recordLen >= LFS_RING_RECORD_LEN_EXT) ? lfsRingHeaderSizeExt() : lfsRingHeaderSize());
+      size_t tmpSlots = lfsRingSlotCount(tmpDataStart, recordLen);
       if (tmpSlots == 0) {
         tmp.close();
         file.close();
@@ -872,14 +1369,14 @@ void handleApiPrune() {
       unsigned long startIndex = (offset + slots - count) % slots;
       for (unsigned long i = 0; i < count; i++) {
         unsigned long idx = (startIndex + i) % slots;
-        size_t pos = dataStart + (idx * LFS_RING_RECORD_LEN);
+        size_t pos = dataStart + (idx * recordLen);
         file.seek(pos);
 
-        char buf[LFS_RING_RECORD_LEN + 1];
-        size_t read = file.readBytes(buf, LFS_RING_RECORD_LEN);
-        buf[read] = '\0';
+        char buf[LFS_RING_RECORD_LEN_EXT + 1];
+        size_t nread = file.readBytes(buf, recordLen);
+        buf[nread] = '\0';
 
-        String line = lfsRingTrimRecord(buf, read);
+        String line = lfsRingTrimRecord(buf, nread);
         if (line.length() == 0) {
           continue;
         }
@@ -893,24 +1390,23 @@ void handleApiPrune() {
         String tsStr = line.substring(0, comma1);
         time_t tsTime = parseISO8601(tsStr);
         if (tsTime != 0 && tsTime >= cutoff) {
-          // Format fixed-length record and write to next slot
           String record = line;
           if (record.endsWith("\n")) {
             record.remove(record.length() - 1);
           }
-          if (record.length() > LFS_RING_RECORD_LEN - 1) {
-            record = record.substring(0, LFS_RING_RECORD_LEN - 1);
+          size_t maxRec = recordLen - 1;
+          if (record.length() > maxRec) {
+            record = record.substring(0, maxRec);
           }
-          while (record.length() < LFS_RING_RECORD_LEN - 1) {
+          while (record.length() < maxRec) {
             record += " ";
           }
           record += "\n";
 
-          size_t wpos = tmpDataStart + (keptInFile * LFS_RING_RECORD_LEN);
+          size_t wpos = tmpDataStart + (keptInFile * recordLen);
           tmp.seek(wpos);
           size_t written = tmp.print(record);
-          if (written != LFS_RING_RECORD_LEN) {
-            // Stop on write error
+          if (written != recordLen) {
             break;
           }
 
@@ -925,7 +1421,13 @@ void handleApiPrune() {
 
       unsigned long newCount = keptInFile;
       unsigned long newOffset = (tmpSlots > 0) ? (newCount % tmpSlots) : 0;
-      lfsRingWriteHeader(tmp, newOffset, newCount);
+      if (isSparse) {
+        lfsRingWriteHeaderSparse(tmp, newOffset, newCount);
+      } else if (recordLen >= LFS_RING_RECORD_LEN_EXT) {
+        lfsRingWriteHeaderExt(tmp, newOffset, newCount);
+      } else {
+        lfsRingWriteHeader(tmp, newOffset, newCount);
+      }
       tmp.flush();
       tmp.close();
       file.close();
@@ -1140,89 +1642,118 @@ void handleApiData() {
   File file = dataRoot.openNextFile();
   while (file && pointCount < MAX_POINTS) {
     if (String(file.name()).endsWith(".csv")) {
+        file.seek(0);
+        String magic = file.readStringUntil('\n');
+        file.seek(0);
         size_t dataStart = 0;
         unsigned long offset = 0;
         unsigned long count = 0;
         size_t slots = 0;
+        size_t recordLen = LFS_RING_RECORD_LEN;
 
-        if (lfsRingReadHeader(file, dataStart, offset, count, slots)) {
+        if (magic == "RB2" && lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)) {
           unsigned long startIndex = (offset + slots - count) % slots;
           for (unsigned long i = 0; i < count && pointCount < MAX_POINTS; i++) {
             unsigned long idx = (startIndex + i) % slots;
-            size_t pos = dataStart + (idx * LFS_RING_RECORD_LEN);
+            size_t pos = dataStart + (idx * recordLen);
             file.seek(pos);
-            char buf[LFS_RING_RECORD_LEN + 1];
-            size_t read = file.readBytes(buf, LFS_RING_RECORD_LEN);
-            buf[read] = '\0';
-            String line = lfsRingTrimRecord(buf, read);
-            if (line.length() == 0) {
-              continue;
+            char buf[LFS_RING_RECORD_LEN_SPARSE + 1];
+            size_t nread = file.readBytes(buf, recordLen);
+            buf[nread] = '\0';
+            String line = lfsRingTrimRecord(buf, nread);
+            if (line.length() < 28) continue;
+            int c1 = line.indexOf(',');
+            if (c1 <= 0) continue;
+            int c2 = line.indexOf(',', c1 + 1);
+            if (c2 <= 0) continue;
+            int c3 = line.indexOf(',', c2 + 1);
+            if (c3 <= 0) continue;
+            String tsStr = line.substring(0, c1);
+            tsStr.trim();
+            time_t tsTime = parseISO8601(tsStr);
+            if (tsTime < fromTime || tsTime > toTime) { yield(); continue; }
+            int sensorId = line.substring(c1 + 1, c2).toInt();
+            if (sensorId < 0 || sensorId > 3) continue;
+            String tStr = line.substring(c2 + 1, c3);
+            String hStr = line.substring(c3 + 1);
+            String payload = "[\"" + tsStr + "\"";
+            for (int s = 0; s < 4; s++) {
+              if (s == sensorId) {
+                payload += "," + tStr + "," + hStr;
+              } else {
+                payload += ",null,null";
+              }
             }
-
+            payload += "]";
+            if (!firstPoint) server.sendContent(",");
+            firstPoint = false;
+            server.sendContent(payload);
+            pointCount++;
+            yield();
+          }
+        } else if (magic == "RB1" && lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen)) {
+          unsigned long startIndex = (offset + slots - count) % slots;
+          for (unsigned long i = 0; i < count && pointCount < MAX_POINTS; i++) {
+            unsigned long idx = (startIndex + i) % slots;
+            size_t pos = dataStart + (idx * recordLen);
+            file.seek(pos);
+            char buf[LFS_RING_RECORD_LEN_EXT + 1];
+            size_t nread = file.readBytes(buf, recordLen);
+            buf[nread] = '\0';
+            String line = lfsRingTrimRecord(buf, nread);
+            if (line.length() == 0) continue;
+            int comma1 = line.indexOf(',');
+            if (comma1 <= 0) continue;
+            int comma2 = line.indexOf(',', comma1 + 1);
+            if (comma2 <= 0) continue;
+            String tsStr = line.substring(0, comma1);
+            time_t tsTime = parseISO8601(tsStr);
+            if (tsTime < fromTime || tsTime > toTime) { yield(); continue; }
+            String rest = line.substring(comma2 + 1);
+            int nCommas = 0;
+            for (size_t c = 0; c < rest.length(); c++) {
+              if (rest.charAt(c) == ',') nCommas++;
+            }
+            String payload;
+            if (nCommas >= 7) {
+              payload = "[\"" + tsStr + "\"," + rest + "]";
+            } else {
+              int comma3 = line.indexOf(',', comma2 + 1);
+              if (comma3 <= 0) { yield(); continue; }
+              String t0 = line.substring(comma2 + 1, comma3);
+              String h0 = line.substring(comma3 + 1);
+              payload = "[\"" + tsStr + "\"," + t0 + "," + h0 + ",null,null,null,null,null,null]";
+            }
+            if (!firstPoint) server.sendContent(",");
+            firstPoint = false;
+            server.sendContent(payload);
+            pointCount++;
+            yield();
+          }
+        } else {
+          file.seek(0);
+          String line = file.readStringUntil('\n');
+          if (!line.startsWith("timestamp")) file.seek(0);
+          while (file.available() && pointCount < MAX_POINTS) {
+            line = file.readStringUntil('\n');
+            if (line.length() == 0) break;
             int comma1 = line.indexOf(',');
             if (comma1 <= 0) continue;
             int comma2 = line.indexOf(',', comma1 + 1);
             int comma3 = line.indexOf(',', comma2 + 1);
             if (comma1 > 0 && comma2 > 0 && comma3 > 0) {
               String tsStr = line.substring(0, comma1);
-              String tempStr = line.substring(comma2 + 1, comma3);
-              String humStr = line.substring(comma3 + 1);
-
               time_t tsTime = parseISO8601(tsStr);
               if (tsTime >= fromTime && tsTime <= toTime) {
-                if (!firstPoint) {
-                  server.sendContent(",");
-                }
+                if (!firstPoint) server.sendContent(",");
                 firstPoint = false;
-
-                String payload = "[\"" + tsStr + "\"," + tempStr + "," + humStr + "]";
-                server.sendContent(payload);
+                String tempStr = line.substring(comma2 + 1, comma3);
+                String humStr = line.substring(comma3 + 1);
+                server.sendContent("[\"" + tsStr + "\"," + tempStr + "," + humStr + "]");
                 pointCount++;
               }
             }
-
             yield();
-          }
-        } else {
-          file.seek(0);
-        // Skip header if exists
-        String line = file.readStringUntil('\n');
-        if (!line.startsWith("timestamp")) {
-          // Not a header, rewind
-          file.seek(0);
-        }
-        
-        while (file.available() && pointCount < MAX_POINTS) {
-          line = file.readStringUntil('\n');
-          if (line.length() == 0) break;
-          
-          // Parse CSV: timestamp,device_id,temperature,humidity
-          int comma1 = line.indexOf(',');
-          if (comma1 <= 0) continue;
-          
-          int comma2 = line.indexOf(',', comma1 + 1);
-          int comma3 = line.indexOf(',', comma2 + 1);
-          
-          if (comma1 > 0 && comma2 > 0 && comma3 > 0) {
-            String tsStr = line.substring(0, comma1);
-            String tempStr = line.substring(comma2 + 1, comma3);
-            String humStr = line.substring(comma3 + 1);
-            
-            // Filter by time range
-            time_t tsTime = parseISO8601(tsStr);
-            if (tsTime >= fromTime && tsTime <= toTime) {
-                if (!firstPoint) {
-                  server.sendContent(",");
-                }
-                firstPoint = false;
-                
-                String payload = "[\"" + tsStr + "\"," + tempStr + "," + humStr + "]";
-                server.sendContent(payload);
-              pointCount++;
-            }
-          }
-          
-          yield(); // Yield to prevent watchdog
           }
         }
     }
@@ -1268,14 +1799,13 @@ void handleApiDownload() {
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  
-  // Stream CSV data with header
-  server.sendContent("timestamp,device_id,temperature_c,humidity_rh\n");
-  
   unsigned long sentLines = 0;
 
   bool useSd = false;
   useSd = sdPresent;
+  if (useSd) {
+    server.sendContent("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
+  }
 
   if (useSd) {
     int startYear = 0, startMonth = 0;
@@ -1321,31 +1851,61 @@ void handleApiDownload() {
       yield();
     }
   } else {
-    // LittleFS directory iteration (ESP32: openNextFile)
+    bool headerSent = false;
     File dlRoot = LittleFS.open("/logs");
     if (dlRoot && dlRoot.isDirectory()) {
       File file = dlRoot.openNextFile();
       while (file) {
         if (String(file.name()).endsWith(".csv")) {
+          file.seek(0);
+          String magic = file.readStringUntil('\n');
+          file.seek(0);
           size_t dataStart = 0;
           unsigned long offset = 0;
           unsigned long count = 0;
           size_t slots = 0;
+          size_t recordLen = LFS_RING_RECORD_LEN;
 
-          if (lfsRingReadHeader(file, dataStart, offset, count, slots)) {
+          if (magic == "RB2" && lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)) {
+            if (!headerSent) {
+              server.sendContent("timestamp,sensor_id,t_c,h_rh\n");
+              headerSent = true;
+            }
             unsigned long startIndex = (offset + slots - count) % slots;
             for (unsigned long i = 0; i < count; i++) {
               unsigned long idx = (startIndex + i) % slots;
-              size_t pos = dataStart + (idx * LFS_RING_RECORD_LEN);
+              size_t pos = dataStart + (idx * recordLen);
               file.seek(pos);
-              char buf[LFS_RING_RECORD_LEN + 1];
-              size_t read = file.readBytes(buf, LFS_RING_RECORD_LEN);
-              buf[read] = '\0';
-              String line = lfsRingTrimRecord(buf, read);
-              if (line.length() == 0) {
-                continue;
+              char buf[LFS_RING_RECORD_LEN_SPARSE + 1];
+              size_t nread = file.readBytes(buf, recordLen);
+              buf[nread] = '\0';
+              String line = lfsRingTrimRecord(buf, nread);
+              if (line.length() < 28) continue;
+              int c1 = line.indexOf(',');
+              if (c1 <= 0) continue;
+              String tsStr = line.substring(0, c1);
+              time_t tsTime = parseISO8601(tsStr);
+              if (tsTime >= fromTime && tsTime <= toTime) {
+                server.sendContent(line + "\n");
+                sentLines++;
               }
-
+              yield();
+            }
+          } else if (magic == "RB1" && lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen)) {
+            if (!headerSent) {
+              server.sendContent("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
+              headerSent = true;
+            }
+            unsigned long startIndex = (offset + slots - count) % slots;
+            for (unsigned long i = 0; i < count; i++) {
+              unsigned long idx = (startIndex + i) % slots;
+              size_t pos = dataStart + (idx * recordLen);
+              file.seek(pos);
+              char buf[LFS_RING_RECORD_LEN_EXT + 1];
+              size_t nread = file.readBytes(buf, recordLen);
+              buf[nread] = '\0';
+              String line = lfsRingTrimRecord(buf, nread);
+              if (line.length() == 0) continue;
               int comma1 = line.indexOf(',');
               if (comma1 > 0) {
                 String tsStr = line.substring(0, comma1);
@@ -1355,21 +1915,18 @@ void handleApiDownload() {
                   sentLines++;
                 }
               }
-
               yield();
             }
           } else {
-            // Skip header
-            String header = file.readStringUntil('\n');
-            if (!header.startsWith("timestamp")) {
-              file.seek(0);
+            if (!headerSent) {
+              server.sendContent("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
+              headerSent = true;
             }
-            
+            String hdr = file.readStringUntil('\n');
+            if (!hdr.startsWith("timestamp")) file.seek(0);
             while (file.available()) {
               String line = file.readStringUntil('\n');
               if (line.length() == 0) break;
-              
-              // Filter by time range
               int comma1 = line.indexOf(',');
               if (comma1 > 0) {
                 String tsStr = line.substring(0, comma1);
@@ -1379,7 +1936,6 @@ void handleApiDownload() {
                   sentLines++;
                 }
               }
-              
               yield();
             }
           }
@@ -1389,8 +1945,10 @@ void handleApiDownload() {
       }
       dlRoot.close();
     }
+    if (!headerSent) {
+      server.sendContent("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
+    }
   }
-  
   server.sendContent("");
   server.client().stop();
 }
@@ -1421,34 +1979,57 @@ void handleApiFiles() {
 }
 
 void handleApiStatus() {
-  // Debug endpoint - shows current state
-  DynamicJsonDocument doc(1400);
-  
-  // Sensor: only include readings when sensor is present (no-sensor mode for website test)
-  doc["sensor"]["connected"] = sensorPresent;
-  if (sensorPresent) {
-    if (sht.read(true)) {
-      doc["sensor"]["temperature"] = sht.getTemperature();
-      doc["sensor"]["humidity"] = sht.getHumidity();
-    } else {
-      doc["sensor"]["temperature"] = (float)((double)0.0 / 0.0);  // read failed
-      doc["sensor"]["humidity"] = (float)((double)0.0 / 0.0);
+  DynamicJsonDocument doc(2048);
+  JsonArray sensorsArr = doc.createNestedArray("sensors");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    JsonObject so = sensorsArr.createNestedObject();
+    so["connected"] = sensorPresent[i];
+    if (sensorPresent[i]) {
+      float t = NAN, h = NAN;
+      if (i == 0 && sht.read(true)) {
+        t = sht.getTemperature();
+        h = sht.getHumidity();
+      } else if (i == 1 && sht1.read(true)) {
+        t = sht1.getTemperature();
+        h = sht1.getHumidity();
+      } else if (i == 2) {
+        readSHT85Soft(I2C2_SDA, I2C2_SCL, &t, &h);
+      } else if (i == 3) {
+        readSHT85Soft(I2C3_SDA, I2C3_SCL, &t, &h);
+      }
+      if (isfinite(t) && isfinite(h)) {
+        so["temperature"] = t;
+        so["humidity"] = h;
+      } else {
+        so["temperature"] = (float)((double)0.0 / 0.0);
+        so["humidity"] = (float)((double)0.0 / 0.0);
+      }
     }
   }
-  // When !sensorPresent, omit temperature/humidity; frontend checks connected
-  
-  // Time info
+  doc["sensor"]["connected"] = sensorPresent[0];
+  if (sensorPresent[0] && sensorsArr.size() > 0) {
+    doc["sensor"]["temperature"] = sensorsArr[0]["temperature"];
+    doc["sensor"]["humidity"] = sensorsArr[0]["humidity"];
+  }
   doc["time"]["iso"] = getISOTimestamp();
   doc["time"]["set"] = config.time_set;
   doc["time"]["epoch"] = (long)time(nullptr);
-  
-  // Config
-  doc["config"]["sample_period_s"] = config.sample_period_s;
+  doc["config"]["sample_period_s"] = config.sample_period_sensor[0];
+  JsonArray spArr = doc["config"].createNestedArray("sample_period_sensor");
+  for (size_t i = 0; i < 4; i++) spArr.add(config.sample_period_sensor[i]);
   doc["config"]["device_id"] = config.device_id;
-  
-  // Heating (SHT85 built-in heater)
-  doc["heating"]["mode"] = config.heating_mode;
-  doc["heating"]["on"] = sensorPresent ? sht.isHeaterOn() : false;
+  doc["heating"]["mode"] = config.heating_mode_sensor[0];
+  JsonArray hmArr = doc["heating"].createNestedArray("mode_sensor");
+  for (size_t i = 0; i < 4; i++) hmArr.add(config.heating_mode_sensor[i]);
+  doc["heating"]["duration_s"] = config.heating_duration_sensor[0];
+  doc["heating"]["interval_s"] = config.heating_interval_sensor[0];
+  JsonArray hdArr = doc["heating"].createNestedArray("duration_sensor");
+  JsonArray hiArr = doc["heating"].createNestedArray("interval_sensor");
+  for (size_t i = 0; i < 4; i++) {
+    hdArr.add(config.heating_duration_sensor[i]);
+    hiArr.add(config.heating_interval_sensor[i]);
+  }
+  doc["heating"]["on"] = sensorPresent[0] ? sht.isHeaterOn() : false;
   
   // Storage (ESP32: totalBytes/usedBytes)
   doc["storage"]["lfs_used"] = LittleFS.usedBytes();
@@ -1484,30 +2065,32 @@ void handleApiStatus() {
   }
 
   JsonObject ring = doc.createNestedObject("ring");
-  ring["file"] = currentLog;
-  if (currentLogExists) {
-    File file = LittleFS.open(currentLog, "r");
-    if (file) {
-      size_t dataStart = 0;
-      unsigned long offset = 0;
-      unsigned long count = 0;
-      size_t slots = 0;
-      bool ok = lfsRingReadHeader(file, dataStart, offset, count, slots);
-      ring["valid"] = ok;
-      if (ok) {
-        ring["data_start"] = (unsigned long)dataStart;
-        ring["offset"] = offset;
-        ring["count"] = count;
-        ring["slots"] = (unsigned long)slots;
-      }
-      file.close();
-    } else {
-      ring["valid"] = false;
-      ring["error"] = "open_failed";
+  String ringPath = currentLogExists ? currentLog : getSparseLogPath();
+  ring["file"] = ringPath;
+  File file = LittleFS.open(ringPath, "r");
+  if (file) {
+    file.seek(0);
+    String magic = file.readStringUntil('\n');
+    file.seek(0);
+    size_t dataStart = 0;
+    unsigned long offset = 0;
+    unsigned long count = 0;
+    size_t slots = 0;
+    size_t recordLen = LFS_RING_RECORD_LEN;
+    bool ok = (magic == "RB2" && lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)) ||
+              (magic == "RB1" && lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen));
+    ring["valid"] = ok;
+    if (ok) {
+      ring["data_start"] = (unsigned long)dataStart;
+      ring["offset"] = offset;
+      ring["count"] = count;
+      ring["slots"] = (unsigned long)slots;
+      ring["sparse"] = (magic == "RB2");
     }
+    file.close();
   } else {
     ring["valid"] = false;
-    ring["error"] = "missing_file";
+    ring["error"] = currentLogExists ? "open_failed" : "missing_file";
   }
   
   String response;
@@ -1595,10 +2178,14 @@ void handleStaticFile() {
   else if (path.endsWith(".js")) contentType = "application/javascript";
   else if (path.endsWith(".css")) contentType = "text/css";
   else if (path.endsWith(".json")) contentType = "application/json";
+  else if (path.endsWith(".ttf")) contentType = "font/ttf";
   
   // Static files (js, css) served without auth for login page to work
   File file = LittleFS.open(path, "r");
   if (!file) {
+    // #region agent log
+    Serial.printf("[Web] Static 404 %s\n", path.c_str());
+    // #endregion
     server.send(404, "text/plain", "File not found");
     return;
   }
@@ -1671,17 +2258,42 @@ void setup() {
     Serial.println("SD card not present or failed");
   }
   
-  // I2C for SHT85 - FireBeetle 2 default SDA=1, SCL=2
+  // I2C for SHT85 - Bus 1 & 2 = hardware (Wire, Wire1); Bus 3 & 4 = software I2C
   Wire.begin(I2C_SDA, I2C_SCL);
-  // Initialize SHT85 sensor
+  Wire1.begin(I2C1_SDA, I2C1_SCL);
   if (!sht.begin()) {
-    Serial.println("SHT85 sensor not found!");
-    sensorPresent = false;
+    Serial.println("SHT85 sensor 0 not found (bus 1)");
+    sensorPresent[0] = false;
   } else {
-    sensorPresent = true;
-    Serial.println("SHT85 sensor initialized");
+    sensorPresent[0] = true;
+    Serial.println("SHT85 sensor 0 OK (bus 1)");
   }
-  
+  if (!sht1.begin()) {
+    Serial.println("SHT85 sensor 1 not found (bus 2)");
+    sensorPresent[1] = false;
+  } else {
+    sensorPresent[1] = true;
+    Serial.println("SHT85 sensor 1 OK (bus 2)");
+  }
+  float t2dummy, h2dummy;
+  if (!readSHT85Soft(I2C2_SDA, I2C2_SCL, &t2dummy, &h2dummy)) {
+    Serial.println("SHT85 sensor 2 not found (bus 3, soft I2C)");
+    sensorPresent[2] = false;
+  } else {
+    sensorPresent[2] = true;
+    Serial.println("SHT85 sensor 2 OK (bus 3, soft I2C)");
+  }
+  if (!readSHT85Soft(I2C3_SDA, I2C3_SCL, &t2dummy, &h2dummy)) {
+    Serial.println("SHT85 sensor 3 not found (bus 4, soft I2C)");
+    sensorPresent[3] = false;
+  } else {
+    sensorPresent[3] = true;
+    Serial.println("SHT85 sensor 3 OK (bus 4, soft I2C)");
+  }
+  // #region agent log
+  Serial.printf("[Sensors] present: %d %d %d %d (expect 4)\n", sensorPresent[0], sensorPresent[1], sensorPresent[2], sensorPresent[3]);
+  // #endregion
+
   // Load or create config FIRST (before RTC check)
   if (!loadConfig()) {
     Serial.println("Creating default config");
@@ -1717,11 +2329,16 @@ void setup() {
   }
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  bool apOk = WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str());
+  delay(100);
+  // Explicit channel 6, max 4 clients, WPA2-PSK (avoids ESP32-S3 default-channel issues)
+  bool apOk = WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str(), 6, false, 4);
   if (!apOk) {
     Serial.println("ERROR: WiFi AP failed to start. Try power cycle or check password (8-63 chars).");
   }
+  delay(100);
   Serial.println("AP started: " + config.ap_ssid);
+  Serial.println("AP password: " + config.ap_password);
+  Serial.println("AP channel: 6");
   Serial.println("AP IP: " + apIP.toString());
   
   // Setup web server routes
@@ -1737,16 +2354,34 @@ void setup() {
   server.on("/api/files", handleApiFiles);
   server.on("/api/status", handleApiStatus);
   server.on("/api/test-sd", handleApiTestSD);
-  
-  // Static files
+  // Explicit static file handlers so these are not "not found" (reliable delivery)
+  server.on("/index.html", HTTP_GET, handleStaticFile);
+  server.on("/styles.css", HTTP_GET, handleStaticFile);
+  server.on("/app.js", HTTP_GET, handleStaticFile);
+  server.on("/apexcharts.min.js", HTTP_GET, handleStaticFile);
+  server.on("/apexcharts-sync-plugin.js", HTTP_GET, handleStaticFile);
+  server.on("/ModernDOS8x16.ttf", HTTP_GET, handleStaticFile);
+
+  // Static files (catch-all for any other path)
+  // #region agent log
   server.onNotFound([]() {
     String path = server.uri();
+    const char* methodStr = (server.method() == HTTP_GET) ? "GET" : (server.method() == HTTP_POST) ? "POST" : (server.method() == 0) ? "OPTIONS" : "OTHER";
+    Serial.printf("[Web] onNotFound %s %s\n", methodStr, path.c_str());
+    if (server.method() == HTTP_OPTIONS) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+      server.send(200, "text/plain", "");
+      return;
+    }
     if (path.startsWith("/api/") || path == "/login" || path == "/logout") {
       handleNotFound();
     } else {
       handleStaticFile();
     }
   });
+  // #endregion
   
   server.begin();
   Serial.println("Web server started");
@@ -1756,7 +2391,7 @@ void setup() {
   Serial.println("\nSetup complete!");
   Serial.println("Connect to: " + config.ap_ssid);
   Serial.println("Password: " + config.ap_password);
-  Serial.println("Sample interval: " + String(config.sample_period_s) + " seconds");
+  Serial.println("Sample intervals (s): S0=" + String(config.sample_period_sensor[0]) + " S1=" + String(config.sample_period_sensor[1]) + " S2=" + String(config.sample_period_sensor[2]) + " S3=" + String(config.sample_period_sensor[3]));
   Serial.println("Current time: " + getISOTimestamp());
   Serial.println("Time set: " + String(config.time_set ? "YES" : "NO"));
   Serial.println("\nDebug: http://192.168.4.1/api/status");
@@ -1773,70 +2408,150 @@ void loop() {
     lastHeartbeat = now;
   }
   
-  // SHT85 heater state machine (non-blocking): only when sensor present and mode != off
-  if (sensorPresent && config.heating_mode != "off") {
-    unsigned int durationSec = 10;
-    unsigned long intervalMs = 300000UL;   // 5 min
-    if (config.heating_mode == "1min_1hr") {
-      durationSec = 60;
-      intervalMs = 3600000UL;
-    } else if (config.heating_mode == "1min_1day") {
-      durationSec = 60;
-      intervalMs = 86400000UL;
-    }
-    const unsigned long durationMs = (unsigned long)durationSec * 1000UL;
-    
-    if (heaterActive) {
-      if (now - heaterStartMs >= durationMs) {
-        sht.heatOff();
-        lastHeaterCycleEndMs = now;
-        heaterActive = false;
-      }
-    } else {
-      if (lastHeaterCycleEndMs == 0 || (now - lastHeaterCycleEndMs >= intervalMs)) {
-        sht.setHeatTimeout((uint8_t)durationSec);
-        if (sht.heatOn()) {
-          heaterStartMs = now;
-          heaterActive = true;
+  // SHT85 heater state machine (non-blocking): only sensor 0 has hardware heater
+  // interval = total cycle period, duration = on-time, off-time = interval - duration
+  {
+    uint32_t durationSec = config.heating_duration_sensor[0];
+    uint32_t intervalSec = config.heating_interval_sensor[0];
+    if (sensorPresent[0] && durationSec > 0 && intervalSec > 0) {
+      const unsigned long durationMs = (unsigned long)durationSec * 1000UL;
+
+      // 100% duty cycle (duration >= interval): keep heater always on
+      if (durationSec >= intervalSec) {
+        if (!heaterActive) {
+          sht.setHeatTimeout(255);
+          if (sht.heatOn()) {
+            heaterStartMs = now;
+            heaterLastRetriggerMs = now;
+            heaterActive = true;
+            Serial.printf("Heater ON (100%% duty, interval=%lus)\n", (unsigned long)intervalSec);
+          }
+        } else if (now - heaterLastRetriggerMs >= 200000UL) {
+          // Re-trigger every 200s to prevent library timeout (setHeatTimeout max 255s)
+          sht.setHeatTimeout(255);
+          sht.heatOn();
+          heaterLastRetriggerMs = now;
+        }
+      } else {
+        // Normal duty cycle: on for durationMs, off for (interval - duration)
+        unsigned long offTimeMs = (unsigned long)(intervalSec - durationSec) * 1000UL;
+
+        if (heaterActive) {
+          // Re-trigger every 200s for long on-durations to prevent library timeout
+          if (now - heaterLastRetriggerMs >= 200000UL && (now - heaterStartMs) < durationMs) {
+            sht.setHeatTimeout(255);
+            sht.heatOn();
+            heaterLastRetriggerMs = now;
+          }
+          // Check if on-duration has elapsed
+          if (now - heaterStartMs >= durationMs) {
+            sht.heatOff();
+            unsigned long offSec = (intervalSec - durationSec);
+            Serial.printf("Heater OFF (ran %lus), next in %lus\n", (unsigned long)((now - heaterStartMs) / 1000UL), offSec);
+            lastHeaterCycleEndMs = now;
+            heaterActive = false;
+          }
         } else {
-          lastHeaterCycleEndMs = now;  // avoid tight loop on failure
+          if (lastHeaterCycleEndMs == 0 || (now - lastHeaterCycleEndMs >= offTimeMs)) {
+            unsigned int durationForDriver = (durationSec > 255) ? 255 : (unsigned int)durationSec;
+            sht.setHeatTimeout((uint8_t)durationForDriver);
+            if (sht.heatOn()) {
+              heaterStartMs = now;
+              heaterLastRetriggerMs = now;
+              heaterActive = true;
+              Serial.printf("Heater ON duration=%lus interval=%lus (duty=%lu%%)\n", (unsigned long)durationSec, (unsigned long)intervalSec, (unsigned long)(durationSec * 100UL / intervalSec));
+            } else {
+              lastHeaterCycleEndMs = now;  // avoid tight loop on failure
+            }
+          }
         }
       }
+    } else if (sensorPresent[0] && (durationSec == 0 || intervalSec == 0) && heaterActive) {
+      sht.heatOff();
+      heaterActive = false;
     }
   }
   
-  // Non-blocking sampling
-  unsigned long intervalMs = (unsigned long)config.sample_period_s * 1000UL;
-  
-  // Take first sample immediately (lastSampleTime starts at 0)
-  // Then sample at configured interval - only when sensor is present
-  // Skip sample when heater is on (readings would be invalid)
-  if (sensorPresent && (lastSampleTime == 0 || (now - lastSampleTime >= intervalMs))) {
-    if (sht.isHeaterOn()) {
+  // Per-sensor sampling: tick at minimum of all sensor intervals
+  unsigned long tickMs = 604800000UL;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (sensorPresent[i]) {
+      unsigned long p = (unsigned long)config.sample_period_sensor[i] * 1000UL;
+      if (p < 10000UL) p = 10000UL;
+      if (p < tickMs) tickMs = p;
+    }
+  }
+  if (tickMs > 604800000UL) tickMs = 3600000UL;
+  if (!sensorPresentAny()) tickMs = 3600000UL;
+
+  if (sensorPresentAny() && (lastSampleTime == 0 || (now - lastSampleTime >= tickMs))) {
+    if (sensorPresent[0] && sht.isHeaterOn()) {
       lastSampleTime = now;
-    } else if (sht.read(true)) {
-      float temperature = sht.getTemperature();
-      float humidity = sht.getHumidity();
-      
-      Serial.print("Sample #");
-      Serial.print(lastSampleTime == 0 ? 1 : (now / intervalMs) + 1);
-      Serial.print(": ");
-      Serial.print(temperature, 2);
-      Serial.print("°C, ");
-      Serial.print(humidity, 2);
-      Serial.print("%RH @ ");
-      Serial.println(getISOTimestamp());
-      
-      if (writeDataPoint(temperature, humidity)) {
-        Serial.println("  -> Saved to storage");
-        ledSampleFlash();  // Flash rapidly to indicate data saved
-      } else {
-        Serial.println("  -> ERROR saving!");
+    } else {
+      bool anyRead = false;
+      bool readThisTick[4] = { false, false, false, false };
+      for (int i = 0; i < NUM_SENSORS; i++) {
+        if (!sensorPresent[i]) continue;
+        unsigned long periodMs = (unsigned long)config.sample_period_sensor[i] * 1000UL;
+        if (periodMs < 10000UL) periodMs = 10000UL;
+        if (lastReadTime[i] == 0 || (now - lastReadTime[i] >= periodMs)) {
+          if (i == 0 && sht.read(true)) {
+            lastT[0] = sht.getTemperature();
+            lastH[0] = sht.getHumidity();
+            lastReadTime[0] = now;
+            readThisTick[0] = true;
+            anyRead = true;
+          } else if (i == 1 && sht1.read(true)) {
+            lastT[1] = sht1.getTemperature();
+            lastH[1] = sht1.getHumidity();
+            lastReadTime[1] = now;
+            readThisTick[1] = true;
+            anyRead = true;
+          } else if (i == 2 && readSHT85Soft(I2C2_SDA, I2C2_SCL, &lastT[2], &lastH[2])) {
+            lastReadTime[2] = now;
+            readThisTick[2] = true;
+            anyRead = true;
+          } else if (i == 3 && readSHT85Soft(I2C3_SDA, I2C3_SCL, &lastT[3], &lastH[3])) {
+            lastReadTime[3] = now;
+            readThisTick[3] = true;
+            anyRead = true;
+          }
+        }
+      }
+      if (anyRead || lastSampleTime == 0) {
+        String timestamp = getISOTimestamp();
+        Serial.print("Sample @ ");
+        Serial.println(timestamp);
+        bool lfsSuccess = false;
+        if (LittleFS.exists("/logs") || LittleFS.mkdir("/logs")) {
+          String sparsePath = getSparseLogPath();
+          for (int i = 0; i < NUM_SENSORS; i++) {
+            if (!readThisTick[i]) continue;
+            if (isfinite(lastT[i]) && isfinite(lastH[i])) {
+              Serial.print(" S");
+              Serial.print(i);
+              Serial.print(":");
+              Serial.print(lastT[i], 2);
+              Serial.print("°C ");
+              Serial.print(lastH[i], 2);
+              Serial.print("%RH");
+              if (writeLfsRingRecordSparse(sparsePath, timestamp, i, lastT[i], lastH[i])) {
+                lfsSuccess = true;
+              }
+            }
+          }
+          Serial.println();
+        }
+        bool sdSuccess = writeSDDataPoint(timestamp, lastT[0], lastH[0], lastT[1], lastH[1], lastT[2], lastH[2], lastT[3], lastH[3]);
+        if (lfsSuccess || sdSuccess) {
+          Serial.println("  -> Saved to storage");
+          ledSampleFlash();
+        } else {
+          writeErrors++;
+          Serial.println("  -> ERROR saving!");
+        }
       }
       lastSampleTime = now;
-      Serial.print("Next sample in ");
-      Serial.print(config.sample_period_s);
-      Serial.println(" seconds");
     }
   }
   

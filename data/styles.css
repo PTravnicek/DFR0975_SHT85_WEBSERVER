@@ -238,9 +238,66 @@ button:hover {
 }
 
 .charts {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.chart-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 12px;
+}
+
+.sensor-options {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    border: 3px solid #000;
+    background: #f5f5f5;
+    font-size: 14px;
+    text-transform: uppercase;
+}
+
+.sensor-options-num {
+    font-weight: bold;
+    margin-right: 4px;
+}
+
+.sensor-options-label {
+    font-weight: bold;
+}
+
+.sensor-options-muted {
+    color: #666;
+    font-size: 12px;
+    text-transform: none;
+}
+
+.sensor-options select {
+    padding: 6px 10px;
+    border: 3px solid #000;
+    font-family: 'ModernDOS', monospace;
+    font-size: 14px;
+    background: #fff;
+}
+
+.btn-small {
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 2px solid #000;
+    background: #fff;
+    cursor: pointer;
+    font-family: 'ModernDOS', monospace;
+    text-transform: uppercase;
+}
+
+.btn-small:hover {
+    background: #000;
+    color: #fff;
 }
 
 .chart-container {
@@ -401,7 +458,7 @@ input[type="password"], input[type="number"], input[type="text"] {
     font-family: 'ModernDOS', monospace;
 }
 
-#liveStatus strong {
+.live-sensor strong {
     font-size: 16px;
     color: #fff !important;
 }
@@ -448,6 +505,9 @@ input[type="password"], input[type="number"], input[type="text"] {
 /* Responsive */
 @media (max-width: 900px) {
     .charts {
+        gap: 8px;
+    }
+    .chart-row {
         grid-template-columns: 1fr;
     }
 }

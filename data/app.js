@@ -1,5 +1,6 @@
-// Global variables
-let tempChart, humChart;
+// Global variables: 4 sensors × (temp + hum) = 8 charts
+let tempCharts = [];
+let humCharts = [];
 let deviceConfig = {};
 let autoRefreshInterval = null;
 let statusRefreshInterval = null;
@@ -12,8 +13,8 @@ document.addEventListener('DOMContentLoaded', function() {
     loadStorageStatus();
     checkTimeStatus();
     
-    // Set default time range and auto-load data
-    setQuickRange(1, true); // Last 24 hours (silent)
+    // Set default time range and auto-load data (7 days to catch device time drift)
+    setQuickRange(7, true);
     
     // Start live status updates (every 5 seconds)
     updateLiveStatus();
@@ -34,37 +35,19 @@ async function updateLiveStatus() {
         if (response.ok) {
             const data = await response.json();
             
-            // Update live readings (handle no-sensor mode)
-            const liveEl = document.getElementById('liveStatus');
-            if (liveEl) {
-                const sensorOk = data.sensor && data.sensor.connected !== false &&
-                    data.sensor.temperature != null && data.sensor.humidity != null &&
-                    typeof data.sensor.temperature === 'number' && typeof data.sensor.humidity === 'number';
-                if (sensorOk) {
-                    const temp = data.sensor.temperature.toFixed(1);
-                    const hum = data.sensor.humidity.toFixed(1);
-                    const heaterOn = data.heating && data.heating.on === true;
-                    liveEl.innerHTML = `<strong>${temp}°C</strong> | <strong>${hum}%RH</strong>${heaterOn ? ' <span class="heater-indicator">Heater on</span>' : ''}`;
-                    liveEl.className = 'status-badge status-ok';
+            const sensors = data.sensors || [];
+            const heaterOn = data.heating && data.heating.on === true;
+            for (let i = 0; i < 4; i++) {
+                const liveEl = document.getElementById('liveStatus' + i);
+                if (!liveEl) continue;
+                const s = sensors[i];
+                if (s && s.connected && typeof s.temperature === 'number' && typeof s.humidity === 'number' && !Number.isNaN(s.temperature)) {
+                    liveEl.textContent = 'S' + i + ': ' + s.temperature.toFixed(1) + '°C ' + s.humidity.toFixed(0) + '%' + (heaterOn ? ' (heater on)' : '');
+                    liveEl.className = 'status-badge live-sensor status-ok';
                 } else {
-                    liveEl.textContent = 'Sensor not connected';
-                    liveEl.className = 'status-badge status-warning';
+                    liveEl.textContent = 'S' + i + ': --';
+                    liveEl.className = 'status-badge live-sensor status-warning';
                 }
-            }
-            
-            // Update sample info
-            const sampleEl = document.getElementById('sampleStatus');
-            if (sampleEl && data.config.sample_period_s) {
-                const interval = data.config.sample_period_s;
-                let intervalText;
-                if (interval < 60) {
-                    intervalText = `${interval}s`;
-                } else if (interval < 3600) {
-                    intervalText = `${Math.round(interval / 60)}m`;
-                } else {
-                    intervalText = `${Math.round(interval / 3600)}h`;
-                }
-                sampleEl.textContent = `Interval: ${intervalText}`;
             }
             
             // Update time display
@@ -79,10 +62,12 @@ async function updateLiveStatus() {
         }
     } catch (error) {
         console.error('Failed to update live status:', error);
-        const liveEl = document.getElementById('liveStatus');
-        if (liveEl) {
-            liveEl.textContent = 'Offline';
-            liveEl.className = 'status-badge status-error';
+        for (let i = 0; i < 4; i++) {
+            const liveEl = document.getElementById('liveStatus' + i);
+            if (liveEl) {
+                liveEl.textContent = 'S' + i + ': Offline';
+                liveEl.className = 'status-badge live-sensor status-error';
+            }
         }
     }
 }
@@ -328,27 +313,131 @@ function initializeCharts() {
         }
     };
 
-    tempChart = new ApexCharts(document.querySelector('#tempChart'), tempOptions);
-    humChart = new ApexCharts(document.querySelector('#humChart'), humOptions);
-    
-    tempChart.render();
-    humChart.render();
+    tempCharts = [];
+    humCharts = [];
+    for (let i = 0; i < 4; i++) {
+        const te = document.querySelector('#tempChart' + i);
+        const he = document.querySelector('#humChart' + i);
+        if (te) {
+            const c = new ApexCharts(te, JSON.parse(JSON.stringify(tempOptions)));
+            c.render();
+            tempCharts.push(c);
+        } else {
+            tempCharts.push(null);
+        }
+        if (he) {
+            const c = new ApexCharts(he, JSON.parse(JSON.stringify(humOptions)));
+            c.render();
+            humCharts.push(c);
+        } else {
+            humCharts.push(null);
+        }
+    }
 }
 
-// Sync charts when one is zoomed/panned
+// Sync all 8 charts when one is zoomed/panned
 function syncCharts(xaxis) {
-    if (xaxis && xaxis.min && xaxis.max) {
-        if (tempChart && humChart) {
-            const activeChart = document.activeElement.closest('.apexcharts-canvas') ? 
-                (document.querySelector('#tempChart .apexcharts-canvas').contains(document.activeElement) ? tempChart : humChart) :
-                tempChart;
-            
-            if (activeChart === tempChart) {
-                humChart.zoomX(xaxis.min, xaxis.max);
-            } else {
-                tempChart.zoomX(xaxis.min, xaxis.max);
-            }
+    if (!xaxis || !xaxis.min || !xaxis.max) return;
+    const all = [...tempCharts, ...humCharts].filter(Boolean);
+    all.forEach(function(ch) {
+        try {
+            ch.zoomX(xaxis.min, xaxis.max);
+        } catch (e) {}
+    });
+}
+
+// Format sampling interval for display (e.g. "10 s", "1 h")
+function formatSampleInterval(seconds) {
+    if (!seconds || seconds < 0) return '--';
+    if (seconds < 60) return seconds + ' s';
+    if (seconds < 3600) return (seconds / 60) + ' min';
+    if (seconds < 86400) return (seconds / 3600) + ' h';
+    return (seconds / 86400) + ' d';
+}
+
+// Derive duration/interval from legacy mode string
+function heatingModeToDurationInterval(mode) {
+    if (mode === '10s_5min') return { duration: 10, interval: 300 };
+    if (mode === '1min_1hr') return { duration: 60, interval: 3600 };
+    if (mode === '1min_1day') return { duration: 60, interval: 86400 };
+    return { duration: 0, interval: 0 };
+}
+
+// Ensure per-sensor arrays exist (backend may return sample_period_sensor, heating_mode_sensor, heating_duration_sensor, heating_interval_sensor)
+function ensurePerSensorConfig() {
+    if (!Array.isArray(deviceConfig.sample_period_sensor)) {
+        const single = deviceConfig.sample_period_s || 3600;
+        deviceConfig.sample_period_sensor = [single, single, single, single];
+    }
+    if (!Array.isArray(deviceConfig.heating_mode_sensor)) {
+        const mode = deviceConfig.heating_mode || 'off';
+        deviceConfig.heating_mode_sensor = [mode, 'off', 'off', 'off'];
+    }
+    if (!Array.isArray(deviceConfig.heating_duration_sensor) || !Array.isArray(deviceConfig.heating_interval_sensor)) {
+        deviceConfig.heating_duration_sensor = [0, 0, 0, 0];
+        deviceConfig.heating_interval_sensor = [0, 0, 0, 0];
+        for (let i = 0; i < 4; i++) {
+            const m = deviceConfig.heating_mode_sensor[i] || 'off';
+            const t = heatingModeToDurationInterval(m);
+            deviceConfig.heating_duration_sensor[i] = t.duration;
+            deviceConfig.heating_interval_sensor[i] = t.interval;
         }
+    }
+}
+
+const SAMPLING_OPTIONS = [10, 30, 60, 300, 600, 3600, 21600, 86400];
+
+function closestSamplingOption(sec) {
+    if (SAMPLING_OPTIONS.indexOf(sec) >= 0) return sec;
+    let best = 3600;
+    for (const o of SAMPLING_OPTIONS) {
+        if (o <= sec) best = o;
+        else break;
+    }
+    return best;
+}
+
+// Enable/disable duty cycle input based on interval selection
+function applyHeatingCycleConstraint(index) {
+    const intervalEl = document.getElementById('sensor' + index + 'HeatingInterval');
+    const dutyCycleEl = document.getElementById('sensor' + index + 'HeatingDutyCycle');
+    if (!intervalEl || !dutyCycleEl) return;
+    const interval = parseInt(intervalEl.value, 10) || 0;
+    dutyCycleEl.disabled = interval === 0;
+    if (interval === 0) {
+        dutyCycleEl.value = 0;
+    } else {
+        let pct = parseInt(dutyCycleEl.value, 10) || 0;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        dutyCycleEl.value = pct;
+    }
+}
+
+// Update all sensor option rows (per-sensor sampling + heating interval/duty cycle)
+function updateAllSensorRowSettings() {
+    ensurePerSensorConfig();
+    const intervalOptions = [0, 300, 3600, 86400];
+    for (let i = 0; i < 4; i++) {
+        const sel = document.getElementById('sensor' + i + 'Sampling');
+        if (sel) {
+            let sec = deviceConfig.sample_period_sensor[i] || 3600;
+            sec = closestSamplingOption(sec);
+            sel.value = String(sec);
+        }
+        const intervalEl = document.getElementById('sensor' + i + 'HeatingInterval');
+        const dutyCycleEl = document.getElementById('sensor' + i + 'HeatingDutyCycle');
+        if (intervalEl) {
+            let inv = deviceConfig.heating_interval_sensor[i] || 0;
+            intervalEl.value = intervalOptions.indexOf(inv) >= 0 ? String(inv) : '0';
+        }
+        if (dutyCycleEl) {
+            const dur = deviceConfig.heating_duration_sensor[i] || 0;
+            const inv = deviceConfig.heating_interval_sensor[i] || 0;
+            const pct = (inv > 0) ? Math.round(dur / inv * 100) : 0;
+            dutyCycleEl.value = pct;
+        }
+        applyHeatingCycleConstraint(i);
     }
 }
 
@@ -360,13 +449,14 @@ async function loadConfig() {
             deviceConfig = await response.json();
             document.getElementById('deviceId').textContent = deviceConfig.device_id || 'ESP8266 Logger';
             updateSettingsForm();
+            updateAllSensorRowSettings();
         }
     } catch (error) {
         console.error('Failed to load config:', error);
     }
 }
 
-// Update settings form with current values
+// Update settings form with current values (interval only)
 function updateSettingsForm() {
     if (!deviceConfig.sample_period_s) return;
     
@@ -392,8 +482,40 @@ function updateSettingsForm() {
     document.getElementById('intervalValue').value = value;
     document.getElementById('intervalUnit').value = unit;
     updateIntervalConstraints();
-    const heatingEl = document.getElementById('heatingMode');
-    if (heatingEl) heatingEl.value = deviceConfig.heating_mode || 'off';
+}
+
+function onModalHeatingIntervalChange() {
+    const intervalEl = document.getElementById('modalHeatingInterval0');
+    const dutyCycleEl = document.getElementById('modalHeatingDutyCycle0');
+    if (!intervalEl || !dutyCycleEl) return;
+    const interval = parseInt(intervalEl.value, 10) || 0;
+    dutyCycleEl.disabled = interval === 0;
+    if (interval === 0) dutyCycleEl.value = 0;
+    else {
+        let pct = parseInt(dutyCycleEl.value, 10) || 0;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        dutyCycleEl.value = pct;
+    }
+}
+
+// Update sensors form with current values (modal: sensor 0 heating)
+function updateSensorsForm() {
+    ensurePerSensorConfig();
+    const intervalOptions = [0, 300, 3600, 86400];
+    const intervalEl = document.getElementById('modalHeatingInterval0');
+    const dutyCycleEl = document.getElementById('modalHeatingDutyCycle0');
+    if (intervalEl) {
+        const inv = deviceConfig.heating_interval_sensor[0] || 0;
+        intervalEl.value = intervalOptions.indexOf(inv) >= 0 ? String(inv) : '0';
+    }
+    if (dutyCycleEl) {
+        const dur = deviceConfig.heating_duration_sensor[0] || 0;
+        const inv = deviceConfig.heating_interval_sensor[0] || 0;
+        const pct = (inv > 0) ? Math.round(dur / inv * 100) : 0;
+        dutyCycleEl.value = pct;
+        dutyCycleEl.disabled = inv === 0;
+    }
 }
 
 function updateIntervalConstraints() {
@@ -620,47 +742,56 @@ async function loadData(silent = false) {
             alert(data.warning);
         }
         
-        // Convert to ApexCharts format
-        const tempData = [];
-        const humData = [];
+        const tempDataBySensor = [[], [], [], []];
+        const humDataBySensor = [[], [], [], []];
         
         if (data.points && Array.isArray(data.points)) {
             for (let i = 0; i < data.points.length; i++) {
                 const point = data.points[i];
                 if (!point || point.length < 3) continue;
                 const timestamp = new Date(point[0]).getTime();
-                tempData.push([timestamp, point[1]]);
-                humData.push([timestamp, point[2]]);
+                const numVal = point.length >= 9 ? 4 : 1;
+                for (let s = 0; s < numVal; s++) {
+                    const ti = s * 2 + 1;
+                    const hi = s * 2 + 2;
+                    const tv = point[ti];
+                    const hv = point[hi];
+                    if (tv != null && hv != null && tv !== 'null' && hv !== 'null') {
+                        const tn = Number(tv);
+                        const hn = Number(hv);
+                        if (Number.isFinite(tn) && Number.isFinite(hn)) {
+                            tempDataBySensor[s].push([timestamp, tn]);
+                            humDataBySensor[s].push([timestamp, hn]);
+                        }
+                    }
+                }
             }
         } else if (data.ts && data.temp && data.hum) {
             for (let i = 0; i < data.ts.length; i++) {
                 const timestamp = new Date(data.ts[i]).getTime();
-                tempData.push([timestamp, data.temp[i]]);
-                humData.push([timestamp, data.hum[i]]);
+                tempDataBySensor[0].push([timestamp, data.temp[i]]);
+                humDataBySensor[0].push([timestamp, data.hum[i]]);
             }
         }
         let firstTs = null;
         let lastTs = null;
-        if (tempData.length > 0) {
-            firstTs = new Date(tempData[0][0]).toISOString();
-            lastTs = new Date(tempData[tempData.length - 1][0]).toISOString();
+        if (tempDataBySensor[0].length > 0) {
+            firstTs = new Date(tempDataBySensor[0][0][0]).toISOString();
+            lastTs = new Date(tempDataBySensor[0][tempDataBySensor[0].length - 1][0]).toISOString();
         }
         
-        // Update charts
-        tempChart.updateSeries([{
-            name: 'Temperature',
-            data: tempData
-        }]);
+        for (let s = 0; s < 4; s++) {
+            if (tempCharts[s]) {
+                tempCharts[s].updateSeries([{ name: 'Temperature', data: tempDataBySensor[s] }]);
+            }
+            if (humCharts[s]) {
+                humCharts[s].updateSeries([{ name: 'Humidity', data: humDataBySensor[s] }]);
+            }
+        }
         
-        humChart.updateSeries([{
-            name: 'Humidity',
-            data: humData
-        }]);
-        
-        // Update data count
         const countEl = document.getElementById('dataCount');
         if (countEl) {
-            const count = Number.isFinite(data.count) ? data.count : tempData.length;
+            const count = Number.isFinite(data.count) ? data.count : (data.points && data.points.length) || 0;
             countEl.textContent = `${count} points`;
         }
         
@@ -670,8 +801,8 @@ async function loadData(silent = false) {
     }
 }
 
-// Download CSV
-async function downloadCSV() {
+// Download CSV. If sensorIndex is 0..3, fetch and save only that sensor's columns; otherwise full CSV via navigation.
+async function downloadCSV(sensorIndex) {
     const fromInput = document.getElementById('fromDate').value;
     const toInput = document.getElementById('toDate').value;
     
@@ -688,12 +819,59 @@ async function downloadCSV() {
         return;
     }
     
-    try {
-        const fromISO = formatISO8601(from);
-        const toISO = formatISO8601(to);
-        
-        const url = `/api/download?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&format=csv&store=auto`;
+    const fromISO = formatISO8601(from);
+    const toISO = formatISO8601(to);
+    const url = `/api/download?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&format=csv&store=auto`;
+    
+    if (sensorIndex === undefined || sensorIndex === null) {
         window.location.href = url;
+        return;
+    }
+    
+    const idx = parseInt(sensorIndex, 10);
+    if (idx < 0 || idx > 3) {
+        window.location.href = url;
+        return;
+    }
+    
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Download failed');
+        const fullCsv = await response.text();
+        const lines = fullCsv.split(/\r?\n/);
+        if (lines.length === 0) {
+            alert('No data in range');
+            return;
+        }
+        const header = lines[0];
+        const isSparse = header.indexOf('sensor_id') >= 0;
+        let outLines;
+        if (isSparse) {
+            outLines = ['timestamp,t_c,h_rh'];
+            for (let i = 1; i < lines.length; i++) {
+                const row = lines[i].split(',');
+                if (row.length >= 4 && parseInt(row[1], 10) === idx) {
+                    outLines.push([row[0], row[2], row[3]].join(','));
+                }
+            }
+        } else {
+            const cols = header.split(',');
+            const wantCols = [0, 1, 2 + idx * 2, 3 + idx * 2];
+            const sensorHeader = wantCols.map(c => cols[c]).join(',');
+            outLines = [sensorHeader];
+            for (let i = 1; i < lines.length; i++) {
+                const row = lines[i].split(',');
+                if (row.length >= 4 + idx * 2) {
+                    outLines.push(wantCols.map(c => row[c]).join(','));
+                }
+            }
+        }
+        const blob = new Blob([outLines.join('\n')], { type: 'text/csv' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = (deviceConfig.device_id || 'logger') + '_' + fromISO.substring(0, 10) + '_' + toISO.substring(0, 10) + '_sensor' + idx + '.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
     } catch (error) {
         console.error('Failed to download CSV:', error);
         alert('Failed to download CSV: ' + error.message);
@@ -709,6 +887,126 @@ function openSettings() {
 function closeSettings() {
     document.getElementById('settingsModal').classList.remove('show');
     document.getElementById('settingsError').classList.remove('show');
+}
+
+// Save one sensor's sampling rate (onchange); sends full sample_period_sensor array
+async function saveSensorSampling(index) {
+    ensurePerSensorConfig();
+    const el = document.getElementById('sensor' + index + 'Sampling');
+    if (!el) return;
+    const sec = parseInt(el.value, 10);
+    if (isNaN(sec) || sec < 10 || sec > 604800) return;
+    const arr = deviceConfig.sample_period_sensor.slice();
+    arr[index] = sec;
+    try {
+        const response = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sample_period_sensor: arr })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            deviceConfig.sample_period_sensor = arr;
+            deviceConfig.sample_period_s = arr[0];
+            updateLiveStatus();
+        }
+    } catch (error) {
+        console.error('Failed to save sensor sampling:', error);
+    }
+}
+
+// When heating interval changes: update constraint and save (duty cycle % is preserved)
+function onHeatingIntervalChange(index) {
+    applyHeatingCycleConstraint(index);
+    saveSensorHeating(index);
+}
+
+// Save one sensor's heating (duty cycle % + interval); computes duration from pct and sends to API
+async function saveSensorHeating(index) {
+    ensurePerSensorConfig();
+    const intervalEl = document.getElementById('sensor' + index + 'HeatingInterval');
+    const dutyCycleEl = document.getElementById('sensor' + index + 'HeatingDutyCycle');
+    if (!intervalEl || !dutyCycleEl) return;
+    let interval = parseInt(intervalEl.value, 10) || 0;
+    let pct = parseInt(dutyCycleEl.value, 10) || 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    let duration = (interval > 0) ? Math.round(interval * pct / 100) : 0;
+    if (interval === 0) duration = 0;
+    const durationArr = deviceConfig.heating_duration_sensor.slice();
+    const intervalArr = deviceConfig.heating_interval_sensor.slice();
+    durationArr[index] = duration;
+    intervalArr[index] = interval;
+    try {
+        const response = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                heating_duration_sensor: durationArr,
+                heating_interval_sensor: intervalArr
+            })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            deviceConfig.heating_duration_sensor = durationArr;
+            deviceConfig.heating_interval_sensor = intervalArr;
+            updateLiveStatus();
+        }
+    } catch (error) {
+        console.error('Failed to save sensor heating:', error);
+    }
+}
+
+// Sensors modal
+function openSensors() {
+    updateSensorsForm();
+    document.getElementById('sensorsModal').classList.add('show');
+}
+
+function closeSensors() {
+    document.getElementById('sensorsModal').classList.remove('show');
+    document.getElementById('sensorsError').classList.remove('show');
+}
+
+async function saveSensors(event) {
+    event.preventDefault();
+    const errorDiv = document.getElementById('sensorsError');
+    errorDiv.classList.remove('show');
+    ensurePerSensorConfig();
+    const intervalEl = document.getElementById('modalHeatingInterval0');
+    const dutyCycleEl = document.getElementById('modalHeatingDutyCycle0');
+    let interval = parseInt(intervalEl && intervalEl.value ? intervalEl.value : 0, 10) || 0;
+    let pct = parseInt(dutyCycleEl && dutyCycleEl.value ? dutyCycleEl.value : 0, 10) || 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    let duration = (interval > 0) ? Math.round(interval * pct / 100) : 0;
+    if (interval === 0) duration = 0;
+    const durationArr = deviceConfig.heating_duration_sensor.slice();
+    const intervalArr = deviceConfig.heating_interval_sensor.slice();
+    durationArr[0] = duration;
+    intervalArr[0] = interval;
+    try {
+        const response = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                heating_duration_sensor: durationArr,
+                heating_interval_sensor: intervalArr
+            })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            closeSensors();
+            loadConfig();
+            updateLiveStatus();
+        } else {
+            errorDiv.textContent = data.error || 'Failed to save sensor settings';
+            errorDiv.classList.add('show');
+        }
+    } catch (error) {
+        errorDiv.textContent = 'Network error';
+        errorDiv.classList.add('show');
+    }
 }
 
 async function saveSettings(event) {
@@ -748,17 +1046,13 @@ async function saveSettings(event) {
         return;
     }
     
-    const heatingModeEl = document.getElementById('heatingMode');
-    const heatingMode = heatingModeEl && ['off', '10s_5min', '1min_1hr', '1min_1day'].includes(heatingModeEl.value)
-        ? heatingModeEl.value : 'off';
-    
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ sample_period_s: periodSeconds, heating_mode: heatingMode })
+            body: JSON.stringify({ sample_period_s: periodSeconds })
         });
         
         const data = await response.json();
