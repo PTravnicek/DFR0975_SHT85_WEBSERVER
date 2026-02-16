@@ -10,6 +10,7 @@
 #include <RTClib.h>
 #include <time.h>
 #include <mbedtls/sha256.h>
+#include <WebSocketsServer.h>
 
 // Hardware objects (SHT85 I2C default address 0x44)
 // ESP32-S3 has only 2 I2C peripherals: Wire and Wire1. Sensors 2 and 3 use software I2C
@@ -110,6 +111,33 @@ static uint8_t softI2CReadByte(int sda, int scl, bool ack) {
 }
 
 // SHT85 at 0x44 on bit-banged bus (sda, scl). Returns true if read OK; fills temp and hum.
+static bool softSht85WriteCmd(int sda, int scl, uint16_t cmd) {
+  const uint8_t addr = 0x44;
+  pinMode(sda, INPUT);
+  pinMode(scl, INPUT);
+  softI2CStart(sda, scl);
+  if (!softI2CWriteByte(sda, scl, (addr << 1) | 0)) {
+    softI2CStop(sda, scl);
+    return false;
+  }
+  if (!softI2CWriteByte(sda, scl, (uint8_t)(cmd >> 8)) || !softI2CWriteByte(sda, scl, (uint8_t)(cmd & 0xFF))) {
+    softI2CStop(sda, scl);
+    return false;
+  }
+  softI2CStop(sda, scl);
+  return true;
+}
+
+static bool softSht85HeaterOn(int sda, int scl) {
+  // SHT3x/SHT85 heater enable command
+  return softSht85WriteCmd(sda, scl, 0x306D);
+}
+
+static bool softSht85HeaterOff(int sda, int scl) {
+  // SHT3x/SHT85 heater disable command
+  return softSht85WriteCmd(sda, scl, 0x3066);
+}
+
 static bool readSHT85Soft(int sda, int scl, float* temp, float* hum) {
   const uint8_t addr = 0x44;
   const uint16_t cmd = 0x2416;  // SHT_MEASUREMENT_FAST
@@ -166,6 +194,8 @@ const unsigned long HEARTBEAT_INTERVAL = 3000; // 3 seconds
 
 // Network objects
 WebServer server(80);
+// WebSocket server (separate port so we can keep WebServer unchanged)
+WebSocketsServer ws(81);
 IPAddress apIP(192, 168, 4, 1);
 
 // Config structure
@@ -199,16 +229,21 @@ const unsigned long SESSION_TIMEOUT = 3600000; // 1 hour
 // Sampling (per-sensor intervals)
 unsigned long lastSampleTime = 0;
 unsigned long lastReadTime[4] = { 0, 0, 0, 0 };
+unsigned long nextReadAtMs[4] = { 0, 0, 0, 0 }; // per-sensor scheduler
 float lastT[4] = { NAN, NAN, NAN, NAN };
 float lastH[4] = { NAN, NAN, NAN, NAN };
 bool sdPresent = false;
 uint32_t writeErrors = 0;
 
-// SHT85 heater state machine (non-blocking)
-bool heaterActive = false;           // true while heater is on
-unsigned long heaterStartMs = 0;    // when current heating cycle started
-unsigned long heaterLastRetriggerMs = 0;  // when heatOn() was last called (for re-trigger)
-unsigned long lastHeaterCycleEndMs = 0;  // when last heating cycle ended
+// SHT85 heater state machine (non-blocking) — per-sensor
+// Heater duty cycle runs independently of sampling.
+struct HeaterState {
+  bool active = false;                 // true while heater is on
+  unsigned long startMs = 0;           // when current heating cycle started
+  unsigned long lastRetriggerMs = 0;   // when heatOn() was last called (for re-trigger for library timeout)
+  unsigned long lastCycleEndMs = 0;    // when last heating cycle ended
+};
+HeaterState heater[NUM_SENSORS];
 
 // LittleFS ring-buffer settings (match larger partition; was 256 KB)
 #ifndef LFS_RING_MAX_BYTES_DEFAULT
@@ -617,26 +652,60 @@ String getLogFilenameForMonth(int year, int month) {
   return String(buffer);
 }
 
-// Path for sparse (RB2) writes: use getLogFilename() if new or already RB2; else use ..._s.csv to avoid overwriting RB1
+// Forward declaration (used by getSparseLogPath before the implementation below)
+void lfsRingWriteHeaderSparse(File& file, unsigned long offset, unsigned long count);
+
+// Path for sparse (RB2) writes.
+// NOTE: On ESP32 VFS, checking existence/opening missing files can spam logs.
+// We therefore cache the chosen path and only probe/create once per month.
 String getSparseLogPath() {
+  static int cachedYear = -1;
+  static int cachedMonth = -1;
+  static String cachedPath = "";
+
+  time_t now = time(nullptr);
+  struct tm* t = gmtime(&now);
+  int year = t ? (t->tm_year + 1900) : 1970;
+  int month = t ? (t->tm_mon + 1) : 1;
+
+  if (cachedYear == year && cachedMonth == month && cachedPath.length() > 0) {
+    return cachedPath;
+  }
+
   String path = getLogFilename();
-  if (!LittleFS.exists(path)) {
-    return path;
-  }
+
+  // Prefer writing RB2 into the main monthly file if it already exists and is RB2.
+  // If the file exists but is RB1/legacy, write to a separate "_s.csv" file.
   File f = LittleFS.open(path, "r");
-  if (!f) {
-    return path;
+  if (f) {
+    String magic = f.readStringUntil('\n');
+    f.close();
+    if (magic == "RB2") {
+      cachedPath = path;
+    } else {
+      int dot = path.lastIndexOf('.');
+      cachedPath = (dot > 0) ? (path.substring(0, dot) + "_s.csv") : (path + "_s");
+    }
+  } else {
+    // File missing: we'll create an RB2 file at the main path.
+    cachedPath = path;
   }
-  String magic = f.readStringUntil('\n');
-  f.close();
-  if (magic == "RB2") {
-    return path;
+
+  // Ensure the chosen sparse file exists (create header once). Use "r" probe only once/month.
+  File r = LittleFS.open(cachedPath, "r");
+  if (r) {
+    r.close();
+  } else {
+    File w = LittleFS.open(cachedPath, "w");
+    if (w) {
+      lfsRingWriteHeaderSparse(w, 0, 0);
+      w.close();
+    }
   }
-  int dot = path.lastIndexOf('.');
-  if (dot > 0) {
-    return path.substring(0, dot) + "_s.csv";
-  }
-  return path + "_s";
+
+  cachedYear = year;
+  cachedMonth = month;
+  return cachedPath;
 }
 
 void normalizeMonthStart(time_t epoch, int& year, int& month) {
@@ -796,6 +865,7 @@ static bool lfsEnsureLogFileExists(const String& filename) {
 }
 
 static bool lfsEnsureSparseLogFileExists(const String& path) {
+  // Keep this very lightweight: getSparseLogPath() already creates the file once/month.
   File r = LittleFS.open(path, "r");
   if (r) {
     r.close();
@@ -1165,6 +1235,16 @@ void handleApiConfig() {
     }
     
     if (saveConfig()) {
+      // Reset per-sensor scheduler so new sampling periods take effect immediately
+      for (int i = 0; i < 4; i++) nextReadAtMs[i] = 0;
+      Serial.printf("[HTTP] Config saved. Sampling: S0=%lus S1=%lus S2=%lus S3=%lus\n",
+                    (unsigned long)config.sample_period_sensor[0], (unsigned long)config.sample_period_sensor[1],
+                    (unsigned long)config.sample_period_sensor[2], (unsigned long)config.sample_period_sensor[3]);
+      Serial.printf("[HTTP] Heating (duration/interval): S0=%lu/%lu S1=%lu/%lu S2=%lu/%lu S3=%lu/%lu\n",
+                    (unsigned long)config.heating_duration_sensor[0], (unsigned long)config.heating_interval_sensor[0],
+                    (unsigned long)config.heating_duration_sensor[1], (unsigned long)config.heating_interval_sensor[1],
+                    (unsigned long)config.heating_duration_sensor[2], (unsigned long)config.heating_interval_sensor[2],
+                    (unsigned long)config.heating_duration_sensor[3], (unsigned long)config.heating_interval_sensor[3]);
       server.send(200, "application/json", "{\"success\":true}");
     } else {
       server.send(500, "application/json", "{\"error\":\"Failed to save config\"}");
@@ -2029,7 +2109,22 @@ void handleApiStatus() {
     hdArr.add(config.heating_duration_sensor[i]);
     hiArr.add(config.heating_interval_sensor[i]);
   }
-  doc["heating"]["on"] = sensorPresent[0] ? sht.isHeaterOn() : false;
+  // Heater status: report per sensor. For soft I2C sensors we expose our scheduled state.
+  JsonArray honArr = doc["heating"].createNestedArray("on_sensor");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    bool on = false;
+    if (!sensorPresent[i]) {
+      on = false;
+    } else if (i == 0) {
+      on = sht.isHeaterOn();
+    } else if (i == 1) {
+      on = sht1.isHeaterOn();
+    } else {
+      on = heater[i].active;
+    }
+    honArr.add(on);
+  }
+  doc["heating"]["on"] = honArr.size() > 0 ? (bool)honArr[0] : false;
   
   // Storage (ESP32: totalBytes/usedBytes)
   doc["storage"]["lfs_used"] = LittleFS.usedBytes();
@@ -2096,6 +2191,169 @@ void handleApiStatus() {
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
+}
+
+// ---- WebSocket protocol ----
+// Device -> client messages:
+//  {"type":"sample","ts":"...","sensor":0,"t":23.1,"h":45.0,"heater":true}
+//  {"type":"status", ... optional snapshot ...}
+// Client -> device messages:
+//  {"type":"set","sample_period_sensor":[...]} 
+//  {"type":"set","heating_duration_sensor":[...],"heating_interval_sensor":[...]}
+// Replies:
+//  {"type":"ack","ok":true}
+//  {"type":"err","message":"..."}
+
+static void wsSendJsonToAll(const String& json) {
+  // WebSockets library API expects a non-const String&
+  String tmp = json;
+  ws.broadcastTXT(tmp);
+}
+
+static void wsSendJson(uint8_t clientNum, const String& json) {
+  String tmp = json;
+  ws.sendTXT(clientNum, tmp);
+}
+
+static void wsSendError(uint8_t clientNum, const char* msg) {
+  DynamicJsonDocument doc(256);
+  doc["type"] = "err";
+  doc["message"] = msg;
+  String out;
+  serializeJson(doc, out);
+  ws.sendTXT(clientNum, out);
+}
+
+static void wsSendAck(uint8_t clientNum, bool ok = true) {
+  DynamicJsonDocument doc(128);
+  doc["type"] = "ack";
+  doc["ok"] = ok;
+  String out;
+  serializeJson(doc, out);
+  ws.sendTXT(clientNum, out);
+}
+
+static bool applyWsConfigPatch(const JsonDocument& doc) {
+  bool changed = false;
+  bool changedSampling = false;
+  bool changedHeating = false;
+
+  if (doc.containsKey("sample_period_sensor") && doc["sample_period_sensor"].is<JsonArray>() && doc["sample_period_sensor"].size() >= 4) {
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t period = doc["sample_period_sensor"][i] | config.sample_period_sensor[i];
+      if (period < 10) period = 10;
+      if (period > 604800) period = 604800;
+      if (config.sample_period_sensor[i] != period) {
+        config.sample_period_sensor[i] = period;
+        changed = true;
+        changedSampling = true;
+      }
+    }
+    config.sample_period_s = config.sample_period_sensor[0];
+  }
+
+  if (doc.containsKey("heating_duration_sensor") && doc["heating_duration_sensor"].is<JsonArray>() && doc["heating_duration_sensor"].size() >= 4 &&
+      doc.containsKey("heating_interval_sensor") && doc["heating_interval_sensor"].is<JsonArray>() && doc["heating_interval_sensor"].size() >= 4) {
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t interval = doc["heating_interval_sensor"][i] | config.heating_interval_sensor[i];
+      uint32_t duration = doc["heating_duration_sensor"][i] | config.heating_duration_sensor[i];
+      if (interval == 0) duration = 0;
+      else if (duration > interval) duration = interval;
+      if (config.heating_interval_sensor[i] != interval || config.heating_duration_sensor[i] != duration) {
+        config.heating_interval_sensor[i] = interval;
+        config.heating_duration_sensor[i] = duration;
+        changed = true;
+        changedHeating = true;
+      }
+    }
+    // keep legacy mode strings derived
+    for (size_t i = 0; i < 4; i++) {
+      uint32_t d = config.heating_duration_sensor[i];
+      uint32_t inv = config.heating_interval_sensor[i];
+      if (inv == 0) config.heating_mode_sensor[i] = "off";
+      else if (d == 10 && inv == 300) config.heating_mode_sensor[i] = "10s_5min";
+      else if (d == 60 && inv == 3600) config.heating_mode_sensor[i] = "1min_1hr";
+      else if (d == 60 && inv == 86400) config.heating_mode_sensor[i] = "1min_1day";
+      else config.heating_mode_sensor[i] = "off";
+    }
+    config.heating_mode = config.heating_mode_sensor[0];
+  }
+
+  if (changed) {
+    saveConfig();
+    // Reset per-sensor scheduler so new sampling periods take effect immediately
+    for (int i = 0; i < 4; i++) nextReadAtMs[i] = 0;
+
+    if (changedSampling) {
+      Serial.printf("[WS] Updated sampling: S0=%lus S1=%lus S2=%lus S3=%lus\n",
+                    (unsigned long)config.sample_period_sensor[0], (unsigned long)config.sample_period_sensor[1],
+                    (unsigned long)config.sample_period_sensor[2], (unsigned long)config.sample_period_sensor[3]);
+    }
+    if (changedHeating) {
+      Serial.printf("[WS] Updated heating (duration/interval): S0=%lu/%lu S1=%lu/%lu S2=%lu/%lu S3=%lu/%lu\n",
+                    (unsigned long)config.heating_duration_sensor[0], (unsigned long)config.heating_interval_sensor[0],
+                    (unsigned long)config.heating_duration_sensor[1], (unsigned long)config.heating_interval_sensor[1],
+                    (unsigned long)config.heating_duration_sensor[2], (unsigned long)config.heating_interval_sensor[2],
+                    (unsigned long)config.heating_duration_sensor[3], (unsigned long)config.heating_interval_sensor[3]);
+    }
+  }
+  return changed;
+}
+
+static String wsMakeConfigJson() {
+  DynamicJsonDocument doc(768);
+  doc["type"] = "config";
+  JsonArray sp = doc.createNestedArray("sample_period_sensor");
+  for (int i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
+  JsonArray hd = doc.createNestedArray("heating_duration_sensor");
+  JsonArray hi = doc.createNestedArray("heating_interval_sensor");
+  for (int i = 0; i < 4; i++) { hd.add(config.heating_duration_sensor[i]); hi.add(config.heating_interval_sensor[i]); }
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+static void wsBroadcastConfig() {
+  wsSendJsonToAll(wsMakeConfigJson());
+}
+
+static void wsSendConfig(uint8_t clientNum) {
+  wsSendJson(clientNum, wsMakeConfigJson());
+}
+
+void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      // Send current config immediately to this client
+      wsSendAck(num, true);
+      wsSendConfig(num);
+      break;
+    }
+    case WStype_TEXT: {
+      DynamicJsonDocument doc(768);
+      DeserializationError err = deserializeJson(doc, payload, length);
+      if (err) {
+        wsSendError(num, "invalid_json");
+        return;
+      }
+      const char* t = doc["type"] | "";
+      String tt = String(t);
+      if (tt == "set") {
+        bool changed = applyWsConfigPatch(doc);
+        wsSendAck(num, true);
+        if (changed) wsBroadcastConfig();
+      } else if (tt == "get") {
+        // Client requests current config
+        wsSendAck(num, true);
+        wsSendConfig(num);
+      } else {
+        wsSendError(num, "unknown_type");
+      }
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 void handleApiTestSD() {
@@ -2205,20 +2463,50 @@ void handleNotFound() {
   server.send(302, "text/plain", "");
 }
 
-// LED indicator functions (FireBeetle 2: active HIGH)
-void ledHeartbeat() {
-  digitalWrite(LED_PIN, HIGH);  // LED ON
-  delay(50);
-  digitalWrite(LED_PIN, LOW);   // LED OFF
+// LED indicator (FireBeetle 2: active HIGH) — non-blocking
+// Heartbeat: short pulse every HEARTBEAT_INTERVAL.
+static bool hbPulseActive = false;
+static unsigned long hbPulseStartMs = 0;
+// Sample flash: 3 pulses.
+static int sampleFlashPhase = 0; // 0=idle, 1..6 phases (ON/OFF)
+static unsigned long sampleFlashPhaseMs = 0;
+
+static void ledTick(unsigned long now) {
+  // Heartbeat pulse handling
+  if (hbPulseActive) {
+    if (now - hbPulseStartMs >= 50) {
+      digitalWrite(LED_PIN, LOW);
+      hbPulseActive = false;
+    }
+  }
+  // Sample flash handling (3 pulses: ON80/OFF80 repeated)
+  if (sampleFlashPhase != 0) {
+    const unsigned long phaseDur = 80;
+    if (now - sampleFlashPhaseMs >= phaseDur) {
+      sampleFlashPhaseMs = now;
+      sampleFlashPhase++;
+      if (sampleFlashPhase > 6) {
+        sampleFlashPhase = 0;
+        digitalWrite(LED_PIN, LOW);
+      } else {
+        // odd phases = ON, even phases = OFF
+        digitalWrite(LED_PIN, (sampleFlashPhase % 2) ? HIGH : LOW);
+      }
+    }
+  }
 }
 
-void ledSampleFlash() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(LED_PIN, HIGH);  // LED ON
-    delay(80);
-    digitalWrite(LED_PIN, LOW);   // LED OFF
-    delay(80);
-  }
+static void ledStartHeartbeatPulse(unsigned long now) {
+  digitalWrite(LED_PIN, HIGH);
+  hbPulseActive = true;
+  hbPulseStartMs = now;
+}
+
+static void ledStartSampleFlash(unsigned long now) {
+  if (sampleFlashPhase != 0) return; // don't stack flashes
+  sampleFlashPhase = 1;
+  sampleFlashPhaseMs = now;
+  digitalWrite(LED_PIN, HIGH);
 }
 
 void setup() {
@@ -2385,6 +2673,11 @@ void setup() {
   
   server.begin();
   Serial.println("Web server started");
+
+  // WebSocket server (port 81)
+  ws.begin();
+  ws.onEvent(onWsEvent);
+  Serial.println("WebSocket server started on port 81");
   
   // Randomness: use esp_random() directly for tokens/salts (no RNG seeding required)
 
@@ -2399,158 +2692,205 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  ws.loop();
   
   unsigned long now = millis();
   
-  // LED heartbeat every 3 seconds
+  // LED tick (non-blocking)
+  ledTick(now);
+
+  // LED heartbeat pulse every HEARTBEAT_INTERVAL
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-    ledHeartbeat();
+    ledStartHeartbeatPulse(now);
     lastHeartbeat = now;
   }
-  
-  // SHT85 heater state machine (non-blocking): only sensor 0 has hardware heater
-  // interval = total cycle period, duration = on-time, off-time = interval - duration
-  {
-    uint32_t durationSec = config.heating_duration_sensor[0];
-    uint32_t intervalSec = config.heating_interval_sensor[0];
-    if (sensorPresent[0] && durationSec > 0 && intervalSec > 0) {
-      const unsigned long durationMs = (unsigned long)durationSec * 1000UL;
 
-      // 100% duty cycle (duration >= interval): keep heater always on
-      if (durationSec >= intervalSec) {
-        if (!heaterActive) {
-          sht.setHeatTimeout(255);
-          if (sht.heatOn()) {
-            heaterStartMs = now;
-            heaterLastRetriggerMs = now;
-            heaterActive = true;
-            Serial.printf("Heater ON (100%% duty, interval=%lus)\n", (unsigned long)intervalSec);
-          }
-        } else if (now - heaterLastRetriggerMs >= 200000UL) {
-          // Re-trigger every 200s to prevent library timeout (setHeatTimeout max 255s)
-          sht.setHeatTimeout(255);
-          sht.heatOn();
-          heaterLastRetriggerMs = now;
+  // SHT85 heater state machines (non-blocking) — per sensor
+  // interval = total cycle period, duration = on-time, off-time = interval - duration
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    uint32_t durationSec = config.heating_duration_sensor[i];
+    uint32_t intervalSec = config.heating_interval_sensor[i];
+    if (!sensorPresent[i] || durationSec == 0 || intervalSec == 0) {
+      // Ensure OFF
+      if (heater[i].active) {
+        if (i == 0) sht.heatOff();
+        else if (i == 1) sht1.heatOff();
+        else if (i == 2) softSht85HeaterOff(I2C2_SDA, I2C2_SCL);
+        else if (i == 3) softSht85HeaterOff(I2C3_SDA, I2C3_SCL);
+        heater[i].active = false;
+      }
+      continue;
+    }
+
+    const unsigned long durationMs = (unsigned long)durationSec * 1000UL;
+
+    auto doHeatOn = [&](int idx) -> bool {
+      if (idx == 0) {
+        sht.setHeatTimeout(255);
+        return sht.heatOn();
+      } else if (idx == 1) {
+        sht1.setHeatTimeout(255);
+        return sht1.heatOn();
+      } else if (idx == 2) {
+        return softSht85HeaterOn(I2C2_SDA, I2C2_SCL);
+      } else {
+        return softSht85HeaterOn(I2C3_SDA, I2C3_SCL);
+      }
+    };
+
+    auto doHeatOff = [&](int idx) {
+      if (idx == 0) sht.heatOff();
+      else if (idx == 1) sht1.heatOff();
+      else if (idx == 2) softSht85HeaterOff(I2C2_SDA, I2C2_SCL);
+      else softSht85HeaterOff(I2C3_SDA, I2C3_SCL);
+    };
+
+    // 100% duty cycle (duration >= interval): keep heater always on
+    if (durationSec >= intervalSec) {
+      if (!heater[i].active) {
+        if (doHeatOn(i)) {
+          heater[i].startMs = now;
+          heater[i].lastRetriggerMs = now;
+          heater[i].active = true;
+          Serial.printf("Heater S%d ON (100%% duty, interval=%lus)\n", i, (unsigned long)intervalSec);
         }
       } else {
-        // Normal duty cycle: on for durationMs, off for (interval - duration)
-        unsigned long offTimeMs = (unsigned long)(intervalSec - durationSec) * 1000UL;
-
-        if (heaterActive) {
-          // Re-trigger every 200s for long on-durations to prevent library timeout
-          if (now - heaterLastRetriggerMs >= 200000UL && (now - heaterStartMs) < durationMs) {
-            sht.setHeatTimeout(255);
-            sht.heatOn();
-            heaterLastRetriggerMs = now;
-          }
-          // Check if on-duration has elapsed
-          if (now - heaterStartMs >= durationMs) {
-            sht.heatOff();
-            unsigned long offSec = (intervalSec - durationSec);
-            Serial.printf("Heater OFF (ran %lus), next in %lus\n", (unsigned long)((now - heaterStartMs) / 1000UL), offSec);
-            lastHeaterCycleEndMs = now;
-            heaterActive = false;
-          }
-        } else {
-          if (lastHeaterCycleEndMs == 0 || (now - lastHeaterCycleEndMs >= offTimeMs)) {
-            unsigned int durationForDriver = (durationSec > 255) ? 255 : (unsigned int)durationSec;
-            sht.setHeatTimeout((uint8_t)durationForDriver);
-            if (sht.heatOn()) {
-              heaterStartMs = now;
-              heaterLastRetriggerMs = now;
-              heaterActive = true;
-              Serial.printf("Heater ON duration=%lus interval=%lus (duty=%lu%%)\n", (unsigned long)durationSec, (unsigned long)intervalSec, (unsigned long)(durationSec * 100UL / intervalSec));
-            } else {
-              lastHeaterCycleEndMs = now;  // avoid tight loop on failure
-            }
-          }
+        // Re-trigger for library-controlled heaters (avoid timeout). For soft buses it is harmless.
+        if (now - heater[i].lastRetriggerMs >= 200000UL) {
+          doHeatOn(i);
+          heater[i].lastRetriggerMs = now;
         }
       }
-    } else if (sensorPresent[0] && (durationSec == 0 || intervalSec == 0) && heaterActive) {
-      sht.heatOff();
-      heaterActive = false;
+      continue;
+    }
+
+    // Normal duty cycle
+    const unsigned long offTimeMs = (unsigned long)(intervalSec - durationSec) * 1000UL;
+
+    if (heater[i].active) {
+      if (now - heater[i].lastRetriggerMs >= 200000UL && (now - heater[i].startMs) < durationMs) {
+        doHeatOn(i);
+        heater[i].lastRetriggerMs = now;
+      }
+      if (now - heater[i].startMs >= durationMs) {
+        doHeatOff(i);
+        Serial.printf("Heater S%d OFF (ran %lus), next in %lus\n", i, (unsigned long)((now - heater[i].startMs) / 1000UL), (unsigned long)(intervalSec - durationSec));
+        heater[i].lastCycleEndMs = now;
+        heater[i].active = false;
+      }
+    } else {
+      if (heater[i].lastCycleEndMs == 0 || (now - heater[i].lastCycleEndMs >= offTimeMs)) {
+        if (doHeatOn(i)) {
+          heater[i].startMs = now;
+          heater[i].lastRetriggerMs = now;
+          heater[i].active = true;
+          Serial.printf("Heater S%d ON duration=%lus interval=%lus (duty=%lu%%)\n", i, (unsigned long)durationSec, (unsigned long)intervalSec, (unsigned long)(durationSec * 100UL / intervalSec));
+        } else {
+          heater[i].lastCycleEndMs = now; // avoid tight failure loop
+        }
+      }
     }
   }
   
-  // Per-sensor sampling: tick at minimum of all sensor intervals
-  unsigned long tickMs = 604800000UL;
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorPresent[i]) {
-      unsigned long p = (unsigned long)config.sample_period_sensor[i] * 1000UL;
-      if (p < 10000UL) p = 10000UL;
-      if (p < tickMs) tickMs = p;
-    }
-  }
-  if (tickMs > 604800000UL) tickMs = 3600000UL;
-  if (!sensorPresentAny()) tickMs = 3600000UL;
+  // Per-sensor sampling: independent schedules using nextReadAtMs[]
+  // Each sensor can run at a different interval without being quantized by a global tick.
+  if (sensorPresentAny()) {
+    bool anyRead = false;
+    bool readThisLoop[4] = { false, false, false, false };
 
-  if (sensorPresentAny() && (lastSampleTime == 0 || (now - lastSampleTime >= tickMs))) {
-    if (sensorPresent[0] && sht.isHeaterOn()) {
-      lastSampleTime = now;
-    } else {
-      bool anyRead = false;
-      bool readThisTick[4] = { false, false, false, false };
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (!sensorPresent[i]) continue;
+
+      unsigned long periodMs = (unsigned long)config.sample_period_sensor[i] * 1000UL;
+      if (periodMs < 10000UL) periodMs = 10000UL;
+
+      if (nextReadAtMs[i] == 0) {
+        // schedule first read immediately
+        nextReadAtMs[i] = now;
+      }
+
+      if ((long)(now - nextReadAtMs[i]) >= 0) {
+        bool ok = false;
+        if (i == 0) {
+          ok = sht.read(true);
+          if (ok) { lastT[0] = sht.getTemperature(); lastH[0] = sht.getHumidity(); }
+        } else if (i == 1) {
+          ok = sht1.read(true);
+          if (ok) { lastT[1] = sht1.getTemperature(); lastH[1] = sht1.getHumidity(); }
+        } else if (i == 2) {
+          ok = readSHT85Soft(I2C2_SDA, I2C2_SCL, &lastT[2], &lastH[2]);
+        } else if (i == 3) {
+          ok = readSHT85Soft(I2C3_SDA, I2C3_SCL, &lastT[3], &lastH[3]);
+        }
+
+        if (ok) {
+          lastReadTime[i] = now;
+        }
+
+        // Reduce drift: keep cadence by advancing from previous schedule.
+        // If we fell behind (e.g., long handler), catch up by skipping missed slots.
+        unsigned long next = nextReadAtMs[i] + periodMs;
+        if (nextReadAtMs[i] == 0 || (long)(now - nextReadAtMs[i]) >= 0) {
+          // if nextReadAtMs was 'now' for first schedule, next becomes now+period
+          next = now + periodMs;
+        }
+        while ((long)(now - next) >= 0) {
+          next += periodMs;
+        }
+        nextReadAtMs[i] = next;
+
+        if (ok) {
+          readThisLoop[i] = true;
+          anyRead = true;
+        }
+      }
+    }
+
+    if (anyRead) {
+      String timestamp = getISOTimestamp();
+
+      // Persist (LittleFS sparse ring) per sensor read
+      bool lfsSuccess = false;
+      bool canLfs = (LittleFS.exists("/logs") || LittleFS.mkdir("/logs"));
+      String sparsePath;
+      if (canLfs) sparsePath = getSparseLogPath();
+
       for (int i = 0; i < NUM_SENSORS; i++) {
-        if (!sensorPresent[i]) continue;
-        unsigned long periodMs = (unsigned long)config.sample_period_sensor[i] * 1000UL;
-        if (periodMs < 10000UL) periodMs = 10000UL;
-        if (lastReadTime[i] == 0 || (now - lastReadTime[i] >= periodMs)) {
-          if (i == 0 && sht.read(true)) {
-            lastT[0] = sht.getTemperature();
-            lastH[0] = sht.getHumidity();
-            lastReadTime[0] = now;
-            readThisTick[0] = true;
-            anyRead = true;
-          } else if (i == 1 && sht1.read(true)) {
-            lastT[1] = sht1.getTemperature();
-            lastH[1] = sht1.getHumidity();
-            lastReadTime[1] = now;
-            readThisTick[1] = true;
-            anyRead = true;
-          } else if (i == 2 && readSHT85Soft(I2C2_SDA, I2C2_SCL, &lastT[2], &lastH[2])) {
-            lastReadTime[2] = now;
-            readThisTick[2] = true;
-            anyRead = true;
-          } else if (i == 3 && readSHT85Soft(I2C3_SDA, I2C3_SCL, &lastT[3], &lastH[3])) {
-            lastReadTime[3] = now;
-            readThisTick[3] = true;
-            anyRead = true;
+        if (!readThisLoop[i]) continue;
+        if (!isfinite(lastT[i]) || !isfinite(lastH[i])) continue;
+
+        if (canLfs) {
+          if (writeLfsRingRecordSparse(sparsePath, timestamp, i, lastT[i], lastH[i])) {
+            lfsSuccess = true;
           }
         }
+
+        // Push live sample to WebSocket clients for fast chart updates (independent of storage)
+        DynamicJsonDocument d(256);
+        d["type"] = "sample";
+        d["ts"] = timestamp;
+        d["sensor"] = i;
+        d["t"] = lastT[i];
+        d["h"] = lastH[i];
+        bool hon = false;
+        if (i == 0) hon = sht.isHeaterOn();
+        else if (i == 1) hon = sht1.isHeaterOn();
+        else hon = heater[i].active;
+        d["heater"] = hon;
+        String out;
+        serializeJson(d, out);
+        wsSendJsonToAll(out);
       }
-      if (anyRead || lastSampleTime == 0) {
-        String timestamp = getISOTimestamp();
-        Serial.print("Sample @ ");
-        Serial.println(timestamp);
-        bool lfsSuccess = false;
-        if (LittleFS.exists("/logs") || LittleFS.mkdir("/logs")) {
-          String sparsePath = getSparseLogPath();
-          for (int i = 0; i < NUM_SENSORS; i++) {
-            if (!readThisTick[i]) continue;
-            if (isfinite(lastT[i]) && isfinite(lastH[i])) {
-              Serial.print(" S");
-              Serial.print(i);
-              Serial.print(":");
-              Serial.print(lastT[i], 2);
-              Serial.print("°C ");
-              Serial.print(lastH[i], 2);
-              Serial.print("%RH");
-              if (writeLfsRingRecordSparse(sparsePath, timestamp, i, lastT[i], lastH[i])) {
-                lfsSuccess = true;
-              }
-            }
-          }
-          Serial.println();
-        }
-        bool sdSuccess = writeSDDataPoint(timestamp, lastT[0], lastH[0], lastT[1], lastH[1], lastT[2], lastH[2], lastT[3], lastH[3]);
-        if (lfsSuccess || sdSuccess) {
-          Serial.println("  -> Saved to storage");
-          ledSampleFlash();
-        } else {
-          writeErrors++;
-          Serial.println("  -> ERROR saving!");
-        }
+
+      // Optional SD write: writes a full row with last-known values
+      bool sdSuccess = writeSDDataPoint(timestamp, lastT[0], lastH[0], lastT[1], lastH[1], lastT[2], lastH[2], lastT[3], lastH[3]);
+
+      if (lfsSuccess || sdSuccess) {
+        ledStartSampleFlash(now);
+      } else {
+        writeErrors++;
       }
+
       lastSampleTime = now;
     }
   }

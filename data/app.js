@@ -5,6 +5,97 @@ let deviceConfig = {};
 let autoRefreshInterval = null;
 let statusRefreshInterval = null;
 
+let ws = null;
+let wsConnected = false;
+
+function setWsBadge(text, ok) {
+    const el = document.getElementById('wsStatus');
+    if (!el) return;
+    el.textContent = 'WS: ' + text;
+    el.className = ok ? 'status-badge status-ok' : 'status-badge status-warning';
+}
+
+function wsConnect() {
+    try {
+        const url = `ws://${location.hostname}:81/`;
+        ws = new WebSocket(url);
+        setWsBadge('Connecting', false);
+
+        ws.onopen = () => {
+            wsConnected = true;
+            setWsBadge('OK', true);
+            console.log('[WS] connected');
+        };
+
+        ws.onclose = () => {
+            wsConnected = false;
+            setWsBadge('Closed', false);
+            console.log('[WS] closed, retrying');
+            // retry
+            setTimeout(wsConnect, 1000);
+        };
+
+        ws.onerror = () => {
+            wsConnected = false;
+            setWsBadge('Error', false);
+            console.log('[WS] error');
+        };
+
+        ws.onmessage = (ev) => {
+            try {
+                // console.log('[WS] msg', ev.data);
+                const msg = JSON.parse(ev.data);
+                if (!msg || !msg.type) return;
+                if (msg.type === 'config') {
+                    console.log('[WS] config', msg);
+                    // update local config snapshot
+                    if (Array.isArray(msg.sample_period_sensor)) deviceConfig.sample_period_sensor = msg.sample_period_sensor;
+                    if (Array.isArray(msg.heating_duration_sensor)) deviceConfig.heating_duration_sensor = msg.heating_duration_sensor;
+                    if (Array.isArray(msg.heating_interval_sensor)) deviceConfig.heating_interval_sensor = msg.heating_interval_sensor;
+                    if (deviceConfig.sample_period_sensor) deviceConfig.sample_period_s = deviceConfig.sample_period_sensor[0];
+                    updateAllSensorRowSettings();
+                } else if (msg.type === 'sample') {
+                    // console.log('[WS] sample', msg);
+                    // fast chart append
+                    const s = Number(msg.sensor);
+                    const ts = new Date(msg.ts).getTime();
+                    const t = Number(msg.t);
+                    const h = Number(msg.h);
+                    if (Number.isFinite(s) && s >= 0 && s < 4 && Number.isFinite(ts)) {
+                        const MAX_LIVE_POINTS = 2000; // avoid unbounded growth
+                        if (Number.isFinite(t) && tempCharts[s]) {
+                            const cur = tempCharts[s].w.config.series[0].data || [];
+                            cur.push([ts, t]);
+                            if (cur.length > MAX_LIVE_POINTS) cur.splice(0, cur.length - MAX_LIVE_POINTS);
+                            tempCharts[s].updateSeries([{ name: 'Temperature', data: cur }], false);
+                        }
+                        if (Number.isFinite(h) && humCharts[s]) {
+                            const cur = humCharts[s].w.config.series[0].data || [];
+                            cur.push([ts, h]);
+                            if (cur.length > MAX_LIVE_POINTS) cur.splice(0, cur.length - MAX_LIVE_POINTS);
+                            humCharts[s].updateSeries([{ name: 'Humidity', data: cur }], false);
+                        }
+                    }
+                }
+            } catch (e) {
+                // ignore
+            }
+        };
+    } catch (e) {
+        setWsBadge('Unavailable', false);
+    }
+}
+
+function wsSend(obj) {
+    if (!wsConnected || !ws) return false;
+    try {
+        ws.send(JSON.stringify(obj));
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
     console.log('Initializing FireBeetle 2 SHT85 Logger...');
@@ -12,6 +103,7 @@ document.addEventListener('DOMContentLoaded', function() {
     loadConfig();
     loadStorageStatus();
     checkTimeStatus();
+    wsConnect();
     
     // Set default time range and auto-load data (7 days to catch device time drift)
     setQuickRange(7, true);
@@ -36,11 +128,12 @@ async function updateLiveStatus() {
             const data = await response.json();
             
             const sensors = data.sensors || [];
-            const heaterOn = data.heating && data.heating.on === true;
+            const heaterOnArr = (data.heating && Array.isArray(data.heating.on_sensor)) ? data.heating.on_sensor : [];
             for (let i = 0; i < 4; i++) {
                 const liveEl = document.getElementById('liveStatus' + i);
                 if (!liveEl) continue;
                 const s = sensors[i];
+                const heaterOn = heaterOnArr[i] === true;
                 if (s && s.connected && typeof s.temperature === 'number' && typeof s.humidity === 'number' && !Number.isNaN(s.temperature)) {
                     liveEl.textContent = 'S' + i + ': ' + s.temperature.toFixed(1) + '°C ' + s.humidity.toFixed(0) + '%' + (heaterOn ? ' (heater on)' : '');
                     liveEl.className = 'status-badge live-sensor status-ok';
@@ -898,6 +991,12 @@ async function saveSensorSampling(index) {
     if (isNaN(sec) || sec < 10 || sec > 604800) return;
     const arr = deviceConfig.sample_period_sensor.slice();
     arr[index] = sec;
+    // Prefer WebSocket for instant UI feel; fallback to HTTP
+    if (wsSend({ type: 'set', sample_period_sensor: arr })) {
+        deviceConfig.sample_period_sensor = arr;
+        deviceConfig.sample_period_s = arr[0];
+        return;
+    }
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
@@ -937,6 +1036,12 @@ async function saveSensorHeating(index) {
     const intervalArr = deviceConfig.heating_interval_sensor.slice();
     durationArr[index] = duration;
     intervalArr[index] = interval;
+    // Prefer WebSocket for instant UI feel; fallback to HTTP
+    if (wsSend({ type: 'set', heating_duration_sensor: durationArr, heating_interval_sensor: intervalArr })) {
+        deviceConfig.heating_duration_sensor = durationArr;
+        deviceConfig.heating_interval_sensor = intervalArr;
+        return;
+    }
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
