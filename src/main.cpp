@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <SD.h>
 #include <SPI.h>
@@ -10,7 +11,13 @@
 #include <RTClib.h>
 #include <time.h>
 #include <mbedtls/sha256.h>
-#include <WebSocketsServer.h>
+#ifdef ESP32
+#include <esp_heap_caps.h>
+#endif
+
+#include "time_util.h"
+#include "soft_i2c_sht85.h"
+#include "i2c_recovery.h"
 
 // Hardware objects (SHT85 I2C default address 0x44)
 // ESP32-S3 has only 2 I2C peripherals: Wire and Wire1. Sensors 2 and 3 use software I2C
@@ -18,160 +25,7 @@
 SHT85 sht(0x44, &Wire);
 SHT85 sht1(0x44, &Wire1);
 
-// ----- Software I2C for SHT85 on buses 3 and 4 (no hardware I2C on ESP32-S3 for bus 2/3) -----
-static uint8_t sht85SoftCrc8(const uint8_t* data, uint8_t len) {
-  const uint8_t POLY = 0x31;
-  uint8_t crc = 0xFF;
-  for (; len; --len) {
-    crc ^= *data++;
-    for (uint8_t i = 8; i; --i)
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ POLY) : (uint8_t)(crc << 1);
-  }
-  return crc;
-}
-
-static void softI2CDelay() {
-  delayMicroseconds(3);
-}
-
-static void softI2CSetSda(int pin, int level) {
-  if (level) {
-    pinMode(pin, INPUT);
-  } else {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-  }
-}
-
-static void softI2CSetScl(int pin, int level) {
-  if (level) {
-    pinMode(pin, INPUT);
-  } else {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-  }
-}
-
-static int softI2CReadSda(int pin) {
-  pinMode(pin, INPUT);
-  return digitalRead(pin);
-}
-
-static void softI2CStart(int sda, int scl) {
-  softI2CSetSda(sda, 1);
-  softI2CSetScl(scl, 1);
-  softI2CDelay();
-  softI2CSetSda(sda, 0);
-  softI2CDelay();
-  softI2CSetScl(scl, 0);
-}
-
-static void softI2CStop(int sda, int scl) {
-  softI2CSetSda(sda, 0);
-  softI2CDelay();
-  softI2CSetScl(scl, 1);
-  softI2CDelay();
-  softI2CSetSda(sda, 1);
-  softI2CDelay();
-}
-
-static bool softI2CWriteByte(int sda, int scl, uint8_t byte) {
-  for (int i = 7; i >= 0; i--) {
-    softI2CSetSda(sda, (byte >> i) & 1);
-    softI2CDelay();
-    softI2CSetScl(scl, 1);
-    softI2CDelay();
-    softI2CSetScl(scl, 0);
-  }
-  softI2CSetSda(sda, 1);
-  softI2CDelay();
-  softI2CSetScl(scl, 1);
-  softI2CDelay();
-  int ack = !softI2CReadSda(sda);
-  softI2CSetScl(scl, 0);
-  return (bool)ack;
-}
-
-static uint8_t softI2CReadByte(int sda, int scl, bool ack) {
-  uint8_t byte = 0;
-  softI2CSetSda(sda, 1);
-  for (int i = 7; i >= 0; i--) {
-    softI2CSetScl(scl, 1);
-    softI2CDelay();
-    byte = (byte << 1) | (softI2CReadSda(sda) ? 1 : 0);
-    softI2CSetScl(scl, 0);
-  }
-  softI2CSetSda(sda, ack ? 0 : 1);
-  softI2CDelay();
-  softI2CSetScl(scl, 1);
-  softI2CDelay();
-  softI2CSetScl(scl, 0);
-  softI2CSetSda(sda, 1);
-  return byte;
-}
-
-// SHT85 at 0x44 on bit-banged bus (sda, scl). Returns true if read OK; fills temp and hum.
-static bool softSht85WriteCmd(int sda, int scl, uint16_t cmd) {
-  const uint8_t addr = 0x44;
-  pinMode(sda, INPUT);
-  pinMode(scl, INPUT);
-  softI2CStart(sda, scl);
-  if (!softI2CWriteByte(sda, scl, (addr << 1) | 0)) {
-    softI2CStop(sda, scl);
-    return false;
-  }
-  if (!softI2CWriteByte(sda, scl, (uint8_t)(cmd >> 8)) || !softI2CWriteByte(sda, scl, (uint8_t)(cmd & 0xFF))) {
-    softI2CStop(sda, scl);
-    return false;
-  }
-  softI2CStop(sda, scl);
-  return true;
-}
-
-static bool softSht85HeaterOn(int sda, int scl) {
-  // SHT3x/SHT85 heater enable command
-  return softSht85WriteCmd(sda, scl, 0x306D);
-}
-
-static bool softSht85HeaterOff(int sda, int scl) {
-  // SHT3x/SHT85 heater disable command
-  return softSht85WriteCmd(sda, scl, 0x3066);
-}
-
-static bool readSHT85Soft(int sda, int scl, float* temp, float* hum) {
-  const uint8_t addr = 0x44;
-  const uint16_t cmd = 0x2416;  // SHT_MEASUREMENT_FAST
-  pinMode(sda, INPUT);
-  pinMode(scl, INPUT);
-  softI2CStart(sda, scl);
-  if (!softI2CWriteByte(sda, scl, (addr << 1) | 0)) {
-    softI2CStop(sda, scl);
-    return false;
-  }
-  if (!softI2CWriteByte(sda, scl, cmd >> 8) || !softI2CWriteByte(sda, scl, cmd & 0xFF)) {
-    softI2CStop(sda, scl);
-    return false;
-  }
-  softI2CStop(sda, scl);
-  delay(5);
-  softI2CStart(sda, scl);
-  if (!softI2CWriteByte(sda, scl, (addr << 1) | 1)) {
-    softI2CStop(sda, scl);
-    return false;
-  }
-  uint8_t buf[6];
-  for (int i = 0; i < 6; i++)
-    buf[i] = softI2CReadByte(sda, scl, (i < 5));
-  softI2CStop(sda, scl);
-  if (buf[2] != sht85SoftCrc8(buf, 2) || buf[5] != sht85SoftCrc8(buf + 3, 2)) {
-    return false;
-  }
-  uint16_t rawT = (uint16_t)buf[0] << 8 | buf[1];
-  uint16_t rawH = (uint16_t)buf[3] << 8 | buf[4];
-  *temp = rawT * (175.0f / 65535.0f) - 45.0f;
-  *hum = rawH * (100.0f / 65535.0f);
-  return true;
-}
+// (soft I2C SHT85 helpers moved to soft_i2c_sht85.cpp)
 static const int NUM_SENSORS = 4;
 RTC_PCF8523 rtc;
 bool rtcPresent = false;
@@ -193,9 +47,8 @@ unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 3000; // 3 seconds
 
 // Network objects
-WebServer server(80);
-// WebSocket server (separate port so we can keep WebServer unchanged)
-WebSocketsServer ws(81);
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 IPAddress apIP(192, 168, 4, 1);
 
 // Config structure
@@ -232,6 +85,8 @@ unsigned long lastReadTime[4] = { 0, 0, 0, 0 };
 unsigned long nextReadAtMs[4] = { 0, 0, 0, 0 }; // per-sensor scheduler
 float lastT[4] = { NAN, NAN, NAN, NAN };
 float lastH[4] = { NAN, NAN, NAN, NAN };
+uint16_t sensorFailStreak[4] = { 0, 0, 0, 0 };
+unsigned long sensorOfflineUntilMs[4] = { 0, 0, 0, 0 };
 bool sdPresent = false;
 uint32_t writeErrors = 0;
 
@@ -247,7 +102,9 @@ HeaterState heater[NUM_SENSORS];
 
 // LittleFS ring-buffer settings (match larger partition; was 256 KB)
 #ifndef LFS_RING_MAX_BYTES_DEFAULT
-#define LFS_RING_MAX_BYTES_DEFAULT (4 * 1024 * 1024)
+// Max bytes reserved for telemetry ring buffer inside LittleFS.
+// With 16MB flash + single factory app, LittleFS is much larger; default to 10MB.
+#define LFS_RING_MAX_BYTES_DEFAULT (10 * 1024 * 1024)
 #endif
 #ifndef LFS_RING_RECORD_LEN_DEFAULT
 #define LFS_RING_RECORD_LEN_DEFAULT 96
@@ -258,6 +115,10 @@ const size_t LFS_RING_MAX_BYTES = LFS_RING_MAX_BYTES_DEFAULT;
 const size_t LFS_RING_RECORD_LEN = LFS_RING_RECORD_LEN_DEFAULT;
 
 // Helper functions
+
+// LittleFS mount status (so we don't call LittleFS.begin() multiple times)
+static bool g_lfsOk = false;
+
 String getChipId() {
   uint64_t mac = ESP.getEfuseMac();
   char buf[17];
@@ -339,11 +200,8 @@ bool verifyPassword(const String& password, const String& hash, const String& sa
   return computed == hash;
 }
 
-String getSessionToken() {
-  if (!server.hasHeader("Cookie")) {
-    return "";
-  }
-  String cookie = server.header("Cookie");
+String getSessionTokenFromCookieHeader(const String& cookie) {
+  if (cookie.length() == 0) return "";
   int start = cookie.indexOf("SESSION=");
   if (start == -1) return "";
   start += 8;
@@ -352,10 +210,22 @@ String getSessionToken() {
   return cookie.substring(start, end);
 }
 
-bool isAuthenticated() {
-  String token = getSessionToken();
+// Legacy helpers for WebServer were removed; auth is currently not enforced on APIs.
+String getSessionToken() {
+  return "";
+}
+
+String getSessionTokenFromRequest(AsyncWebServerRequest* request) {
+  if (!request) return "";
+  if (!request->hasHeader("Cookie")) return "";
+  const AsyncWebHeader* h = request->getHeader("Cookie");
+  if (!h) return "";
+  return getSessionTokenFromCookieHeader(h->value());
+}
+
+bool isAuthenticated(AsyncWebServerRequest* request) {
+  String token = getSessionTokenFromRequest(request);
   if (token.length() == 0) return false;
-  
   unsigned long now = millis();
   for (int i = 0; i < sessionCount; i++) {
     if (authSessions[i].token == token && authSessions[i].expires > now) {
@@ -365,12 +235,15 @@ bool isAuthenticated() {
   return false;
 }
 
+// Back-compat: keep old isAuthenticated() signature unused
+bool isAuthenticated() {
+  return false;
+}
+
+// Session management helpers (auth currently not enforced in Async handlers)
 void addSession(const String& token) {
   if (sessionCount >= 10) {
-    // Remove oldest session
-    for (int i = 0; i < 9; i++) {
-      authSessions[i] = authSessions[i + 1];
-    }
+    for (int i = 0; i < 9; i++) authSessions[i] = authSessions[i + 1];
     sessionCount = 9;
   }
   authSessions[sessionCount].token = token;
@@ -381,31 +254,34 @@ void addSession(const String& token) {
 void removeSession(const String& token) {
   for (int i = 0; i < sessionCount; i++) {
     if (authSessions[i].token == token) {
-      for (int j = i; j < sessionCount - 1; j++) {
-        authSessions[j] = authSessions[j + 1];
-      }
+      for (int j = i; j < sessionCount - 1; j++) authSessions[j] = authSessions[j + 1];
       sessionCount--;
       break;
     }
   }
 }
 
-bool requireAuth() {
-  if (!isAuthenticated()) {
-    server.sendHeader("Location", "/login");
-    server.send(302, "text/plain", "");
+static bool requireAuth(AsyncWebServerRequest* request) {
+  if (!isAuthenticated(request)) {
+    request->redirect("/login");
     return false;
   }
   return true;
 }
 
-bool requireApiAuth() {
-  if (!isAuthenticated()) {
-    server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+static bool requireApiAuth(AsyncWebServerRequest* request) {
+  if (!isAuthenticated(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
     return false;
   }
   return true;
 }
+
+// Forward declarations (needed for lambdas in setup/loop)
+static void wsSendJsonToAll(const String& json);
+static bool applyWsConfigPatch(const JsonDocument& doc);
+static void onWsEvent(AsyncWebSocket* serverPtr, AsyncWebSocketClient* client, AwsEventType type,
+                      void* arg, uint8_t* data, size_t len);
 
 // Config management
 bool loadConfig() {
@@ -421,11 +297,17 @@ bool loadConfig() {
   String content = file.readString();
   file.close();
   
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DeserializationError error = deserializeJson(doc, content);
   if (error) {
+    // #region agent log
+    Serial.printf("[DBG] loadConfig FAILED: %s content_len=%u\n", error.c_str(), (unsigned)content.length());
+    // #endregion
     return false;
   }
+  // #region agent log
+  Serial.printf("[DBG] loadConfig OK: json_mem=%u/%u content_len=%u\n", (unsigned)doc.memoryUsage(), 2048U, (unsigned)content.length());
+  // #endregion
   
   config.config_version = doc["config_version"] | 1;
   {
@@ -535,7 +417,7 @@ bool loadConfig() {
 }
 
 bool saveConfig() {
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   doc["config_version"] = config.config_version;
   doc["device_id"] = config.device_id;
   doc["ap_ssid"] = config.ap_ssid;
@@ -604,53 +486,7 @@ void getDefaultConfig() {
 }
 
 // Time functions
-String getISOTimestamp() {
-  time_t now = time(nullptr);
-  if (now < 946684800) { // Before 2000-01-01, time not set
-    return "1970-01-01T00:00:00Z";
-  }
-  
-  struct tm* timeinfo = gmtime(&now);
-  int year = timeinfo->tm_year + 1900;
-  int month = timeinfo->tm_mon + 1;
-  int day = timeinfo->tm_mday;
-  int hour = timeinfo->tm_hour;
-  int minute = timeinfo->tm_min;
-  int second = timeinfo->tm_sec;
-  String ts = String(year);
-  ts += "-";
-  if (month < 10) ts += "0";
-  ts += String(month);
-  ts += "-";
-  if (day < 10) ts += "0";
-  ts += String(day);
-  ts += "T";
-  if (hour < 10) ts += "0";
-  ts += String(hour);
-  ts += ":";
-  if (minute < 10) ts += "0";
-  ts += String(minute);
-  ts += ":";
-  if (second < 10) ts += "0";
-  ts += String(second);
-  ts += "Z";
-  return ts;
-}
-
-String getLogFilename() {
-  time_t now = time(nullptr);
-  struct tm* timeinfo = gmtime(&now);
-  char buffer[40];
-  snprintf(buffer, sizeof(buffer), "/logs/%04d-%02d.csv",
-           timeinfo->tm_year + 1900, timeinfo->tm_mon + 1);
-  return String(buffer);
-}
-
-String getLogFilenameForMonth(int year, int month) {
-  char buffer[40];
-  snprintf(buffer, sizeof(buffer), "/logs/%04d-%02d.csv", year, month);
-  return String(buffer);
-}
+// (time helpers moved to time_util.cpp)
 
 // Forward declaration (used by getSparseLogPath before the implementation below)
 void lfsRingWriteHeaderSparse(File& file, unsigned long offset, unsigned long count);
@@ -708,11 +544,7 @@ String getSparseLogPath() {
   return cachedPath;
 }
 
-void normalizeMonthStart(time_t epoch, int& year, int& month) {
-  struct tm* t = gmtime(&epoch);
-  year = t->tm_year + 1900;
-  month = t->tm_mon + 1;
-}
+// normalizeMonthStart moved to time_util.cpp
 
 static const char LFS_RING_HEADER_1SENSOR[] = "H:timestamp,device_id,temperature_c,humidity_rh\n";
 static const char LFS_RING_HEADER_4SENSOR[] = "H:timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n";
@@ -1047,7 +879,22 @@ size_t estimateSampleBytes() {
   return LFS_RING_RECORD_LEN_SPARSE;  // sparse: one record per sensor read
 }
 
+// Combined sampling rate across all sensors (records/second).
+// Each sensor produces 1 record per its sampling period.
+static double combinedSampleRateSps() {
+  double sps = 0.0;
+  for (int i = 0; i < 4; i++) {
+    // If a sensor is not present, it won't produce records.
+    if (!sensorPresent[i]) continue;
+    const uint32_t p = config.sample_period_sensor[i];
+    if (p == 0) continue;
+    sps += 1.0 / (double)p;
+  }
+  return sps;
+}
+
 // API Handlers
+#if 0
 void handleRoot() {
   // Serve index.html without auth - login modal handles authentication
   File file = LittleFS.open("/index.html", "r");
@@ -1302,48 +1149,53 @@ void handleApiTime() {
 
 void handleApiStorage() {
   // No auth required - WiFi password is sufficient
-  
-  size_t lfsTotal = LittleFS.totalBytes();
-  size_t lfsUsed = LittleFS.usedBytes();
-  size_t bytesPerSample = estimateSampleBytes();
-  size_t freeBytes = lfsTotal - lfsUsed;
-  size_t capacityBytes = LFS_RING_MAX_BYTES;
-  if (capacityBytes > lfsTotal) {
-    capacityBytes = lfsTotal;
+
+  const size_t lfsTotal = LittleFS.totalBytes();
+  const size_t lfsUsed = LittleFS.usedBytes();
+  const size_t freeBytes = (lfsTotal > lfsUsed) ? (lfsTotal - lfsUsed) : 0;
+
+  const size_t bytesPerSample = estimateSampleBytes();
+
+  // Capacity is limited by (a) ring cap, and (b) what is actually free right now.
+  size_t capacityBytes = freeBytes;
+  if (capacityBytes > LFS_RING_MAX_BYTES) capacityBytes = LFS_RING_MAX_BYTES;
+
+  // Estimate records + retention time based on *combined* sampling rate across sensors.
+  unsigned long estSamples = 0;     // "samples" here = log records written
+  unsigned long estDuration = 0;    // seconds
+
+  const double sps = combinedSampleRateSps();
+  if (bytesPerSample > 0 && sps > 0.0) {
+    estSamples = (unsigned long)(capacityBytes / bytesPerSample);
+    estDuration = (unsigned long)((double)estSamples / sps);
   }
-  if (capacityBytes > freeBytes) {
-    capacityBytes = freeBytes;
-  }
-  unsigned long samplePeriod = config.sample_period_s;
-  unsigned long estSamples = 0;
-  unsigned long estDuration = 0;
-  if (bytesPerSample > 0 && samplePeriod > 0) {
-    estSamples = capacityBytes / bytesPerSample;
-    estDuration = estSamples * samplePeriod;
-  }
-  
-  DynamicJsonDocument doc(768);
+
+  DynamicJsonDocument doc(1024);
   doc["lfs"]["total"] = lfsTotal;
   doc["lfs"]["used"] = lfsUsed;
   doc["lfs"]["free"] = freeBytes;
   doc["sd"]["present"] = sdPresent;
   doc["write_errors"] = writeErrors;
-  doc["sample_period_s"] = samplePeriod;
+
+  // Back-compat: keep sample_period_s, but report sensor0 period (UI uses per-sensor arrays elsewhere)
+  doc["sample_period_s"] = config.sample_period_sensor[0];
+
   doc["retention"]["bytes_per_sample"] = bytesPerSample;
+  doc["retention"]["capacity_bytes"] = capacityBytes;
+  doc["retention"]["sample_rate_sps"] = sps;
+  JsonArray sp = doc["retention"].createNestedArray("sample_period_sensor");
+  for (int i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
+  JsonArray present = doc["retention"].createNestedArray("sensor_present");
+  for (int i = 0; i < 4; i++) present.add(sensorPresent[i]);
+
   doc["retention"]["est_samples"] = estSamples;
   doc["retention"]["est_duration_s"] = estDuration;
-  
-  if (sdPresent) {
-    // SD card size info not always available
-    doc["sd"]["total"] = 0;
-    doc["sd"]["used"] = 0;
-    doc["sd"]["free"] = 0;
-  } else {
-    doc["sd"]["total"] = 0;
-    doc["sd"]["used"] = 0;
-    doc["sd"]["free"] = 0;
-  }
-  
+
+  // SD card size info not always available
+  doc["sd"]["total"] = 0;
+  doc["sd"]["used"] = 0;
+  doc["sd"]["free"] = 0;
+
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
@@ -1648,37 +1500,10 @@ static time_t timegmCompat(const struct tm& t) {
   return (time_t)seconds;
 }
 
-// Parse ISO8601 timestamp to epoch (UTC). Accepts: YYYY-MM-DDTHH:MM:SSZ
-time_t parseISO8601(const String& iso) {
-  if (iso.length() < 19) return 0;
-  if (iso.charAt(4) != '-' || iso.charAt(7) != '-' || iso.charAt(10) != 'T' || iso.charAt(13) != ':' || iso.charAt(16) != ':') {
-    return 0;
-  }
+// (parseISO8601 moved to time_util.cpp)
+#endif
 
-  int year = iso.substring(0, 4).toInt();
-  int month = iso.substring(5, 7).toInt();
-  int day = iso.substring(8, 10).toInt();
-  int hour = iso.substring(11, 13).toInt();
-  int minute = iso.substring(14, 16).toInt();
-  int second = iso.substring(17, 19).toInt();
-
-  if (month < 1 || month > 12) return 0;
-  if (day < 1 || day > daysInMonth(year, month)) return 0;
-  if (hour < 0 || hour > 23) return 0;
-  if (minute < 0 || minute > 59) return 0;
-  if (second < 0 || second > 59) return 0;
-
-  struct tm timeinfo = {0};
-  timeinfo.tm_year = year - 1900;
-  timeinfo.tm_mon = month - 1;
-  timeinfo.tm_mday = day;
-  timeinfo.tm_hour = hour;
-  timeinfo.tm_min = minute;
-  timeinfo.tm_sec = second;
-
-  return timegmCompat(timeinfo);
-}
-
+#if 0 // legacy synchronous handlers (WebServer-style). Async versions are registered in setup().
 void handleApiData() {
   // No auth required - WiFi password is sufficient
   
@@ -2193,44 +2018,45 @@ void handleApiStatus() {
   server.send(200, "application/json", response);
 }
 
-// ---- WebSocket protocol ----
+#endif // legacy synchronous handlers
+
+// (time parsing helpers moved to time_util.cpp)
+// ---- WebSocket protocol (AsyncWebSocket) ----
 // Device -> client messages:
 //  {"type":"sample","ts":"...","sensor":0,"t":23.1,"h":45.0,"heater":true}
-//  {"type":"status", ... optional snapshot ...}
+//  {"type":"config","sample_period_sensor":[...],"heating_duration_sensor":[...],"heating_interval_sensor":[...]}
 // Client -> device messages:
-//  {"type":"set","sample_period_sensor":[...]} 
-//  {"type":"set","heating_duration_sensor":[...],"heating_interval_sensor":[...]}
+//  {"type":"set", ...}
+//  {"type":"get"}
 // Replies:
 //  {"type":"ack","ok":true}
 //  {"type":"err","message":"..."}
 
 static void wsSendJsonToAll(const String& json) {
-  // WebSockets library API expects a non-const String&
-  String tmp = json;
-  ws.broadcastTXT(tmp);
+  ws.textAll(json);
 }
 
-static void wsSendJson(uint8_t clientNum, const String& json) {
-  String tmp = json;
-  ws.sendTXT(clientNum, tmp);
+static void wsSendJson(AsyncWebSocketClient* client, const String& json) {
+  if (!client) return;
+  client->text(json);
 }
 
-static void wsSendError(uint8_t clientNum, const char* msg) {
+static void wsSendError(AsyncWebSocketClient* client, const char* msg) {
   DynamicJsonDocument doc(256);
   doc["type"] = "err";
   doc["message"] = msg;
   String out;
   serializeJson(doc, out);
-  ws.sendTXT(clientNum, out);
+  wsSendJson(client, out);
 }
 
-static void wsSendAck(uint8_t clientNum, bool ok = true) {
+static void wsSendAck(AsyncWebSocketClient* client, bool ok = true) {
   DynamicJsonDocument doc(128);
   doc["type"] = "ack";
   doc["ok"] = ok;
   String out;
   serializeJson(doc, out);
-  ws.sendTXT(clientNum, out);
+  wsSendJson(client, out);
 }
 
 static bool applyWsConfigPatch(const JsonDocument& doc) {
@@ -2238,7 +2064,15 @@ static bool applyWsConfigPatch(const JsonDocument& doc) {
   bool changedSampling = false;
   bool changedHeating = false;
 
-  if (doc.containsKey("sample_period_sensor") && doc["sample_period_sensor"].is<JsonArray>() && doc["sample_period_sensor"].size() >= 4) {
+  if (doc.containsKey("sample_period_sensor")) {
+    // #region agent log
+    Serial.printf("[CFG] patch has sample_period_sensor: isArrayConst=%d size=%d\n",
+                  (int)doc["sample_period_sensor"].is<JsonArrayConst>(),
+                  (int)(doc["sample_period_sensor"].is<JsonArrayConst>() ? doc["sample_period_sensor"].size() : -1));
+    // #endregion
+  }
+
+  if (doc.containsKey("sample_period_sensor") && doc["sample_period_sensor"].is<JsonArrayConst>() && doc["sample_period_sensor"].size() >= 4) {
     for (size_t i = 0; i < 4; i++) {
       uint32_t period = doc["sample_period_sensor"][i] | config.sample_period_sensor[i];
       if (period < 10) period = 10;
@@ -2252,8 +2086,8 @@ static bool applyWsConfigPatch(const JsonDocument& doc) {
     config.sample_period_s = config.sample_period_sensor[0];
   }
 
-  if (doc.containsKey("heating_duration_sensor") && doc["heating_duration_sensor"].is<JsonArray>() && doc["heating_duration_sensor"].size() >= 4 &&
-      doc.containsKey("heating_interval_sensor") && doc["heating_interval_sensor"].is<JsonArray>() && doc["heating_interval_sensor"].size() >= 4) {
+  if (doc.containsKey("heating_duration_sensor") && doc["heating_duration_sensor"].is<JsonArrayConst>() && doc["heating_duration_sensor"].size() >= 4 &&
+      doc.containsKey("heating_interval_sensor") && doc["heating_interval_sensor"].is<JsonArrayConst>() && doc["heating_interval_sensor"].size() >= 4) {
     for (size_t i = 0; i < 4; i++) {
       uint32_t interval = doc["heating_interval_sensor"][i] | config.heating_interval_sensor[i];
       uint32_t duration = doc["heating_duration_sensor"][i] | config.heating_duration_sensor[i];
@@ -2266,7 +2100,6 @@ static bool applyWsConfigPatch(const JsonDocument& doc) {
         changedHeating = true;
       }
     }
-    // keep legacy mode strings derived
     for (size_t i = 0; i < 4; i++) {
       uint32_t d = config.heating_duration_sensor[i];
       uint32_t inv = config.heating_interval_sensor[i];
@@ -2281,9 +2114,7 @@ static bool applyWsConfigPatch(const JsonDocument& doc) {
 
   if (changed) {
     saveConfig();
-    // Reset per-sensor scheduler so new sampling periods take effect immediately
     for (int i = 0; i < 4; i++) nextReadAtMs[i] = 0;
-
     if (changedSampling) {
       Serial.printf("[WS] Updated sampling: S0=%lus S1=%lus S2=%lus S3=%lus\n",
                     (unsigned long)config.sample_period_sensor[0], (unsigned long)config.sample_period_sensor[1],
@@ -2317,45 +2148,50 @@ static void wsBroadcastConfig() {
   wsSendJsonToAll(wsMakeConfigJson());
 }
 
-static void wsSendConfig(uint8_t clientNum) {
-  wsSendJson(clientNum, wsMakeConfigJson());
+static void wsSendConfig(AsyncWebSocketClient* client) {
+  wsSendJson(client, wsMakeConfigJson());
 }
 
-void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED: {
-      // Send current config immediately to this client
-      wsSendAck(num, true);
-      wsSendConfig(num);
-      break;
-    }
-    case WStype_TEXT: {
-      DynamicJsonDocument doc(768);
-      DeserializationError err = deserializeJson(doc, payload, length);
-      if (err) {
-        wsSendError(num, "invalid_json");
-        return;
-      }
-      const char* t = doc["type"] | "";
-      String tt = String(t);
-      if (tt == "set") {
-        bool changed = applyWsConfigPatch(doc);
-        wsSendAck(num, true);
-        if (changed) wsBroadcastConfig();
-      } else if (tt == "get") {
-        // Client requests current config
-        wsSendAck(num, true);
-        wsSendConfig(num);
-      } else {
-        wsSendError(num, "unknown_type");
-      }
-      break;
-    }
-    default:
-      break;
+static void onWsEvent(AsyncWebSocket* serverPtr, AsyncWebSocketClient* client, AwsEventType type,
+                      void* arg, uint8_t* data, size_t len) {
+  (void)serverPtr;
+  if (!client) return;
+
+  if (type == WS_EVT_CONNECT) {
+    wsSendAck(client, true);
+    wsSendConfig(client);
+    return;
+  }
+
+  if (type != WS_EVT_DATA) return;
+
+  AwsFrameInfo* info = (AwsFrameInfo*)arg;
+  if (!info || !info->final || info->index != 0 || info->len != len || info->opcode != WS_TEXT) {
+    return;
+  }
+
+  DynamicJsonDocument doc(768);
+  DeserializationError err = deserializeJson(doc, data, len);
+  if (err) {
+    wsSendError(client, "invalid_json");
+    return;
+  }
+
+  const char* t = doc["type"] | "";
+  String tt = String(t);
+  if (tt == "set") {
+    bool changed = applyWsConfigPatch(doc);
+    wsSendAck(client, true);
+    if (changed) wsBroadcastConfig();
+  } else if (tt == "get") {
+    wsSendAck(client, true);
+    wsSendConfig(client);
+  } else {
+    wsSendError(client, "unknown_type");
   }
 }
 
+#if 0
 void handleApiTestSD() {
   DynamicJsonDocument doc(512);
   
@@ -2414,7 +2250,9 @@ void handleApiTestSD() {
   serializeJson(doc, response);
   server.send(200, "application/json", response);
 }
+#endif
 
+#if 0
 void handleStaticFile() {
   String path = server.uri();
   if (path == "/") path = "/index.html";
@@ -2462,6 +2300,7 @@ void handleNotFound() {
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "");
 }
+#endif
 
 // LED indicator (FireBeetle 2: active HIGH) — non-blocking
 // Heartbeat: short pulse every HEARTBEAT_INTERVAL.
@@ -2509,6 +2348,11 @@ static void ledStartSampleFlash(unsigned long now) {
   digitalWrite(LED_PIN, HIGH);
 }
 
+// Simple AP health/restart (best-effort)
+static unsigned long apLastCheckMs = 0;   // set to millis() after AP start
+static unsigned long apRestartAfterMs = 0;
+static unsigned long apBackoffMs = 1000;
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -2520,22 +2364,32 @@ void setup() {
   Serial.println("\n\nFireBeetle 2 SHT85 Temperature/Humidity Logger");
   Serial.println("================================================");
   
+  // Establish non-empty defaults early so WiFi AP can still come up even if FS fails.
+  // (FS is used for persistence + serving UI, but AP should be recoverable.)
+  getDefaultConfig();
+
   // Initialize LittleFS; format on corrupt (e.g. first boot or different board)
-  if (!LittleFS.begin(false)) {  // false = do not format on first try
+  // NOTE: ESP32 partition CSV tooling commonly supports subtype "spiffs" only; LittleFS uses that partition.
+  // The Arduino LittleFS implementation defaults to partition label "spiffs" unless overridden.
+  g_lfsOk = LittleFS.begin(false, "/littlefs", 10, "spiffs"); // false = do not format on first try
+  if (!g_lfsOk) {
     Serial.println("LittleFS mount failed, formatting...");
-    if (!LittleFS.begin(true)) {  // true = format then mount
-      Serial.println("LittleFS still failed after format!");
-      return;
+    g_lfsOk = LittleFS.begin(true, "/littlefs", 10, "spiffs"); // true = format then mount
+    if (!g_lfsOk) {
+      Serial.println("LittleFS still failed after format! Continuing with defaults (no persistence, no web UI files).");
+    } else {
+      Serial.println("LittleFS formatted and mounted");
     }
-    Serial.println("LittleFS formatted and mounted");
   } else {
     Serial.println("LittleFS mounted");
   }
-  
-  // Ensure /logs/ directory exists
-  if (!LittleFS.exists("/logs")) {
-    LittleFS.mkdir("/logs");
-    Serial.println("Created /logs directory");
+
+  if (g_lfsOk) {
+    // Ensure /logs/ directory exists
+    if (!LittleFS.exists("/logs")) {
+      LittleFS.mkdir("/logs");
+      Serial.println("Created /logs directory");
+    }
   }
   
   // Initialize SD card (optional) - FireBeetle 2 SD_CS = 9
@@ -2549,6 +2403,10 @@ void setup() {
   // I2C for SHT85 - Bus 1 & 2 = hardware (Wire, Wire1); Bus 3 & 4 = software I2C
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire1.begin(I2C1_SDA, I2C1_SCL);
+  #if defined(ESP32)
+  Wire.setTimeOut(50);
+  Wire1.setTimeOut(50);
+  #endif
   if (!sht.begin()) {
     Serial.println("SHT85 sensor 0 not found (bus 1)");
     sensorPresent[0] = false;
@@ -2583,12 +2441,17 @@ void setup() {
   // #endregion
 
   // Load or create config FIRST (before RTC check)
-  if (!loadConfig()) {
-    Serial.println("Creating default config");
-    getDefaultConfig();
-    saveConfig();
+  // Only attempt persistence when LittleFS is mounted; otherwise keep defaults.
+  if (g_lfsOk) {
+    if (!loadConfig()) {
+      Serial.println("Creating default config");
+      // defaults were already set; just persist them
+      saveConfig();
+    }
+    Serial.println("Config loaded: " + config.device_id);
+  } else {
+    Serial.println("Config using defaults (LittleFS not available): " + config.device_id);
   }
-  Serial.println("Config loaded: " + config.device_id);
   
   // Initialize RTC (optional) - AFTER loading config
   if (rtc.begin()) {
@@ -2610,15 +2473,41 @@ void setup() {
     }
   }
   
-  // Setup WiFi AP (WPA2 requires password length 8-63)
+    // Setup WiFi AP (WPA2 requires password length 8-63)
   if (config.ap_password.length() < 8 || config.ap_password.length() > 63) {
     config.ap_password = "logger123";
     saveConfig();
   }
+
+  // WiFi robustness: log events + avoid power-save surprises
+  WiFi.setSleep(false);
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    switch (event) {
+      case ARDUINO_EVENT_WIFI_AP_START:
+        Serial.println("[WiFi] AP_START");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STOP:
+        Serial.println("[WiFi] AP_STOP");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+        Serial.printf("[WiFi] STA_CONNECTED: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                      info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1], info.wifi_ap_staconnected.mac[2],
+                      info.wifi_ap_staconnected.mac[3], info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5]);
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+        Serial.printf("[WiFi] STA_DISCONNECTED: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                      info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1], info.wifi_ap_stadisconnected.mac[2],
+                      info.wifi_ap_stadisconnected.mac[3], info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+        break;
+      default:
+        break;
+    }
+  });
+
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   delay(100);
-  // Explicit channel 6, max 4 clients, WPA2-PSK (avoids ESP32-S3 default-channel issues)
+  // Explicit channel 6, max 4 clients
   bool apOk = WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str(), 6, false, 4);
   if (!apOk) {
     Serial.println("ERROR: WiFi AP failed to start. Try power cycle or check password (8-63 chars).");
@@ -2628,56 +2517,777 @@ void setup() {
   Serial.println("AP password: " + config.ap_password);
   Serial.println("AP channel: 6");
   Serial.println("AP IP: " + apIP.toString());
+  apLastCheckMs = millis();  // suppress health-check for the first 5 s after AP start
   
-  // Setup web server routes
-  server.on("/", handleRoot);
-  server.on("/login", handleLogin);
-  server.on("/logout", handleLogout);
-  server.on("/api/config", handleApiConfig);
-  server.on("/api/time", handleApiTime);
-  server.on("/api/storage", handleApiStorage);
-  server.on("/api/prune", handleApiPrune);
-  server.on("/api/data", handleApiData);
-  server.on("/api/download", handleApiDownload);
-  server.on("/api/files", handleApiFiles);
-  server.on("/api/status", handleApiStatus);
-  server.on("/api/test-sd", handleApiTestSD);
-  // Explicit static file handlers so these are not "not found" (reliable delivery)
-  server.on("/index.html", HTTP_GET, handleStaticFile);
-  server.on("/styles.css", HTTP_GET, handleStaticFile);
-  server.on("/app.js", HTTP_GET, handleStaticFile);
-  server.on("/apexcharts.min.js", HTTP_GET, handleStaticFile);
-  server.on("/apexcharts-sync-plugin.js", HTTP_GET, handleStaticFile);
-  server.on("/ModernDOS8x16.ttf", HTTP_GET, handleStaticFile);
+  // (Async migration) old synchronous WebServer route setup removed
+  
+  // Web server routes
 
-  // Static files (catch-all for any other path)
-  // #region agent log
-  server.onNotFound([]() {
-    String path = server.uri();
-    const char* methodStr = (server.method() == HTTP_GET) ? "GET" : (server.method() == HTTP_POST) ? "POST" : (server.method() == 0) ? "OPTIONS" : "OTHER";
-    Serial.printf("[Web] onNotFound %s %s\n", methodStr, path.c_str());
-    if (server.method() == HTTP_OPTIONS) {
-      server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-      server.send(200, "text/plain", "");
+  // WebSocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // /health (tiny)
+  server.on("/health", HTTP_GET, [](AsyncWebServerRequest* request) {
+    // Keep this small and deterministic.
+    DynamicJsonDocument doc(768);
+    doc["ok"] = true;
+    doc["uptime_ms"] = (unsigned long)millis();
+    doc["heap_free"] = (unsigned long)ESP.getFreeHeap();
+    #ifdef ESP32
+    // largest free block helps detect fragmentation
+    doc["heap_largest_free"] = (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    #endif
+    doc["lfs_total"] = (unsigned long)LittleFS.totalBytes();
+    doc["lfs_used"] = (unsigned long)LittleFS.usedBytes();
+    doc["sd_present"] = sdPresent;
+    doc["ws_clients"] = (unsigned long)ws.count();
+    doc["ap_clients"] = (unsigned long)WiFi.softAPgetStationNum();
+    doc["wifi_channel"] = (unsigned long)WiFi.channel();
+    doc["time_iso"] = getISOTimestamp();
+
+    // Sensor ages (ms since last read), null if never
+    JsonArray age = doc.createNestedArray("sensor_age_ms");
+    unsigned long now = millis();
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (!sensorPresent[i] || lastReadTime[i] == 0) age.add(nullptr);
+      else age.add((unsigned long)(now - lastReadTime[i]));
+    }
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // API: status
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    DynamicJsonDocument doc(2048);
+    JsonArray sensorsArr = doc.createNestedArray("sensors");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      JsonObject so = sensorsArr.createNestedObject();
+      so["connected"] = sensorPresent[i];
+      if (sensorPresent[i]) {
+        so["temperature"] = (isfinite(lastT[i]) ? lastT[i] : (float)((double)0.0 / 0.0));
+        so["humidity"] = (isfinite(lastH[i]) ? lastH[i] : (float)((double)0.0 / 0.0));
+      }
+    }
+    doc["time"]["iso"] = getISOTimestamp();
+    doc["time"]["set"] = config.time_set;
+    doc["time"]["epoch"] = (long)time(nullptr);
+
+    doc["config"]["sample_period_s"] = config.sample_period_sensor[0];
+    JsonArray spArr = doc["config"].createNestedArray("sample_period_sensor");
+    for (int i = 0; i < 4; i++) spArr.add(config.sample_period_sensor[i]);
+
+    JsonArray honArr = doc["heating"].createNestedArray("on_sensor");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      bool on = false;
+      if (!sensorPresent[i]) on = false;
+      else if (i == 0) on = sht.isHeaterOn();
+      else if (i == 1) on = sht1.isHeaterOn();
+      else on = heater[i].active;
+      honArr.add(on);
+    }
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // API: config (GET)
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
+    DynamicJsonDocument doc(768);
+    doc["device_id"] = config.device_id;
+    doc["sample_period_s"] = config.sample_period_sensor[0];
+    JsonArray sp = doc.createNestedArray("sample_period_sensor");
+    for (int i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
+    doc["log_timezone_offset_min"] = config.log_timezone_offset_min;
+    doc["file_rotation"] = config.file_rotation;
+    doc["time_set"] = config.time_set;
+    doc["heating_mode"] = config.heating_mode_sensor[0];
+    JsonArray hm = doc.createNestedArray("heating_mode_sensor");
+    for (int i = 0; i < 4; i++) hm.add(config.heating_mode_sensor[i]);
+    JsonArray hd = doc.createNestedArray("heating_duration_sensor");
+    JsonArray hi = doc.createNestedArray("heating_interval_sensor");
+    for (int i = 0; i < 4; i++) { hd.add(config.heating_duration_sensor[i]); hi.add(config.heating_interval_sensor[i]); }
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // API: config (POST) body handler
+  server.on("/api/config", HTTP_POST,
+    [](AsyncWebServerRequest* request) {},
+    NULL,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      static String body;
+      if (index == 0) {
+        body = "";
+        body.reserve(total);
+      }
+      // IMPORTANT: data is not null-terminated; append exact bytes
+      body.concat((const char*)data, len);
+      if (index + len != total) return;
+
+      DynamicJsonDocument doc(768);
+      DeserializationError derr = deserializeJson(doc, body);
+      if (derr) {
+        // #region agent log
+        Serial.printf("[HTTP] /api/config invalid_json: %s body_len=%u\n", derr.c_str(), (unsigned)body.length());
+        // #endregion
+        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+      // #region agent log
+      Serial.printf("[HTTP] /api/config POST body_len=%u\n", (unsigned)body.length());
+      // #endregion
+      bool changed = applyWsConfigPatch(doc);
+      // #region agent log
+      Serial.printf("[HTTP] /api/config applied changed=%d now S0=%lus S1=%lus S2=%lus S3=%lus\n",
+                    (int)changed,
+                    (unsigned long)config.sample_period_sensor[0], (unsigned long)config.sample_period_sensor[1],
+                    (unsigned long)config.sample_period_sensor[2], (unsigned long)config.sample_period_sensor[3]);
+      // #endregion
+      DynamicJsonDocument resp(256);
+      resp["success"] = true;
+      resp["changed"] = changed;
+      JsonArray sp = resp.createNestedArray("sample_period_sensor");
+      for (int i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
+      String out;
+      serializeJson(resp, out);
+      request->send(200, "application/json", out);
+    }
+  );
+
+  // API: time
+  server.on("/api/time", HTTP_GET, [](AsyncWebServerRequest* request) {
+    time_t now = time(nullptr);
+    DynamicJsonDocument doc(256);
+    doc["epoch"] = now;
+    doc["time_set"] = config.time_set && (now >= 946684800);
+    doc["iso"] = getISOTimestamp();
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  server.on("/api/time", HTTP_POST,
+    [](AsyncWebServerRequest* request) {},
+    NULL,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      static String body;
+      if (index == 0) {
+        body = "";
+        body.reserve(total);
+      }
+      // IMPORTANT: data is not null-terminated; append exact bytes
+      body.concat((const char*)data, len);
+      if (index + len != total) return;
+
+      DynamicJsonDocument doc(256);
+      DeserializationError derr = deserializeJson(doc, body);
+      if (derr) {
+        // #region agent log
+        Serial.printf("[HTTP] /api/time invalid_json: %s body_len=%u\n", derr.c_str(), (unsigned)body.length());
+        // #endregion
+        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+      if (!doc.containsKey("epoch")) {
+        request->send(400, "application/json", "{\"error\":\"Missing epoch\"}");
+        return;
+      }
+      time_t epoch = doc["epoch"];
+      timeval tv = {epoch, 0};
+      settimeofday(&tv, nullptr);
+      config.time_set = true;
+      saveConfig();
+      if (rtcPresent) {
+        struct tm* timeinfo = localtime(&epoch);
+        rtc.adjust(DateTime(timeinfo->tm_year + 1900, timeinfo->tm_mon + 1,
+                           timeinfo->tm_mday, timeinfo->tm_hour,
+                           timeinfo->tm_min, timeinfo->tm_sec));
+      }
+      request->send(200, "application/json", "{\"success\":true}");
+    }
+  );
+
+  // ---- Migrated Async APIs ----
+
+  // /api/storage
+  server.on("/api/storage", HTTP_GET, [](AsyncWebServerRequest* request) {
+    const size_t lfsTotal = LittleFS.totalBytes();
+    const size_t lfsUsed = LittleFS.usedBytes();
+    const size_t freeBytes = (lfsTotal > lfsUsed) ? (lfsTotal - lfsUsed) : 0;
+
+    const size_t bytesPerSample = estimateSampleBytes();
+
+    // Capacity for *new* telemetry, based on currently free space and ring cap.
+    size_t capacityBytes = freeBytes;
+    if (capacityBytes > LFS_RING_MAX_BYTES) capacityBytes = LFS_RING_MAX_BYTES;
+
+    unsigned long estSamples = 0;   // records
+    unsigned long estDuration = 0;  // seconds
+
+    const double sps = combinedSampleRateSps();
+    if (bytesPerSample > 0 && sps > 0.0) {
+      estSamples = (unsigned long)(capacityBytes / bytesPerSample);
+      estDuration = (unsigned long)((double)estSamples / sps);
+    }
+
+    DynamicJsonDocument doc(1024);
+    doc["lfs"]["total"] = lfsTotal;
+    doc["lfs"]["used"] = lfsUsed;
+    doc["lfs"]["free"] = freeBytes;
+    doc["sd"]["present"] = sdPresent;
+    doc["write_errors"] = writeErrors;
+
+    // Back-compat
+    doc["sample_period_s"] = config.sample_period_sensor[0];
+
+    doc["retention"]["bytes_per_sample"] = bytesPerSample;
+    doc["retention"]["capacity_bytes"] = capacityBytes;
+    doc["retention"]["sample_rate_sps"] = sps;
+    JsonArray sp = doc["retention"].createNestedArray("sample_period_sensor");
+    for (int i = 0; i < 4; i++) sp.add(config.sample_period_sensor[i]);
+    JsonArray present = doc["retention"].createNestedArray("sensor_present");
+    for (int i = 0; i < 4; i++) present.add(sensorPresent[i]);
+
+    doc["retention"]["est_samples"] = estSamples;
+    doc["retention"]["est_duration_s"] = estDuration;
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // /api/files
+  server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* request) {
+    DynamicJsonDocument doc(2048);
+    JsonArray files = doc.createNestedArray("files");
+
+    File root = LittleFS.open("/logs");
+    if (root && root.isDirectory()) {
+      File file = root.openNextFile();
+      while (file) {
+        String fn = file.name();
+        if (fn.endsWith(".csv")) {
+          JsonObject fo = files.createNestedObject();
+          fo["name"] = fn;
+          fo["size"] = (unsigned long)file.size();
+        }
+        file = root.openNextFile();
+      }
+      root.close();
+    }
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // /api/test-sd
+  server.on("/api/test-sd", HTTP_GET, [](AsyncWebServerRequest* request) {
+    DynamicJsonDocument doc(512);
+    if (!sdPresent) {
+      doc["success"] = false;
+      doc["error"] = "SD card not detected";
+      String out; serializeJson(doc, out);
+      request->send(200, "application/json", out);
       return;
     }
-    if (path.startsWith("/api/") || path == "/login" || path == "/logout") {
-      handleNotFound();
-    } else {
-      handleStaticFile();
-    }
-  });
-  // #endregion
-  
-  server.begin();
-  Serial.println("Web server started");
 
-  // WebSocket server (port 81)
-  ws.begin();
-  ws.onEvent(onWsEvent);
-  Serial.println("WebSocket server started on port 81");
+    String testFile = "/sd_test.txt";
+    String testData = "FireBeetle2 SD Test - " + getISOTimestamp();
+
+    File f = SD.open(testFile, FILE_WRITE);
+    if (!f) {
+      doc["success"] = false;
+      doc["error"] = "Failed to open file for writing";
+      String out; serializeJson(doc, out);
+      request->send(200, "application/json", out);
+      return;
+    }
+    f.println(testData);
+    f.close();
+
+    f = SD.open(testFile, FILE_READ);
+    if (!f) {
+      doc["success"] = false;
+      doc["error"] = "Failed to open file for reading";
+      String out; serializeJson(doc, out);
+      request->send(200, "application/json", out);
+      return;
+    }
+    String readBack = f.readStringUntil('\n');
+    f.close();
+    SD.remove(testFile);
+
+    if (readBack.startsWith("FireBeetle2 SD Test")) {
+      doc["success"] = true;
+      doc["message"] = "SD card read/write test passed";
+    } else {
+      doc["success"] = false;
+      doc["error"] = "Data verification failed";
+    }
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // /api/data (stream JSON points)
+  server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("from") || !request->hasParam("to")) {
+      request->send(400, "application/json", "{\"error\":\"Missing from/to parameters\"}");
+      return;
+    }
+    String fromStr = request->getParam("from")->value();
+    String toStr = request->getParam("to")->value();
+    time_t fromTime = parseISO8601(fromStr);
+    time_t toTime = parseISO8601(toStr);
+    if (fromTime == 0 || toTime == 0) {
+      request->send(400, "application/json", "{\"error\":\"Invalid timestamp format\"}");
+      return;
+    }
+
+    const int MAX_POINTS = 20000;
+    int pointCount = 0;
+
+    AsyncResponseStream* response = request->beginResponseStream("application/json");
+    response->print("{\"points\":[");
+    bool firstPoint = true;
+
+    File dataRoot = LittleFS.open("/logs");
+    if (dataRoot && dataRoot.isDirectory()) {
+      File file = dataRoot.openNextFile();
+      while (file && pointCount < MAX_POINTS) {
+        String name = file.name();
+        if (name.endsWith(".csv")) {
+          file.seek(0);
+          String magic = file.readStringUntil('\n');
+          file.seek(0);
+
+          size_t dataStart = 0;
+          unsigned long offset = 0;
+          unsigned long count = 0;
+          size_t slots = 0;
+          size_t recordLen = LFS_RING_RECORD_LEN;
+
+          if (magic == "RB2" && lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)) {
+            unsigned long startIndex = (offset + slots - count) % slots;
+            for (unsigned long i = 0; i < count && pointCount < MAX_POINTS; i++) {
+              unsigned long idx = (startIndex + i) % slots;
+              size_t pos = dataStart + (idx * recordLen);
+              file.seek(pos);
+              char buf[LFS_RING_RECORD_LEN_SPARSE + 1];
+              size_t nread = file.readBytes(buf, recordLen);
+              buf[nread] = '\0';
+              String line = lfsRingTrimRecord(buf, nread);
+              if (line.length() < 28) continue;
+              int c1 = line.indexOf(',');
+              int c2 = line.indexOf(',', c1 + 1);
+              int c3 = line.indexOf(',', c2 + 1);
+              if (c1 <= 0 || c2 <= 0 || c3 <= 0) continue;
+              String tsStr = line.substring(0, c1);
+              tsStr.trim();
+              time_t tsTime = parseISO8601(tsStr);
+              if (tsTime < fromTime || tsTime > toTime) continue;
+              int sensorId = line.substring(c1 + 1, c2).toInt();
+              if (sensorId < 0 || sensorId > 3) continue;
+              String tStr = line.substring(c2 + 1, c3);
+              String hStr = line.substring(c3 + 1);
+
+              if (!firstPoint) response->print(',');
+              firstPoint = false;
+
+              response->print("[\""); response->print(tsStr); response->print("\"");
+              for (int s = 0; s < 4; s++) {
+                if (s == sensorId) {
+                  response->print(','); response->print(tStr);
+                  response->print(','); response->print(hStr);
+                } else {
+                  response->print(",null,null");
+                }
+              }
+              response->print(']');
+              pointCount++;
+            }
+          } else if (magic == "RB1" && lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen)) {
+            unsigned long startIndex = (offset + slots - count) % slots;
+            for (unsigned long i = 0; i < count && pointCount < MAX_POINTS; i++) {
+              unsigned long idx = (startIndex + i) % slots;
+              size_t pos = dataStart + (idx * recordLen);
+              file.seek(pos);
+              char buf[LFS_RING_RECORD_LEN_EXT + 1];
+              size_t nread = file.readBytes(buf, recordLen);
+              buf[nread] = '\0';
+              String line = lfsRingTrimRecord(buf, nread);
+              if (line.length() == 0) continue;
+              int comma1 = line.indexOf(',');
+              if (comma1 <= 0) continue;
+              int comma2 = line.indexOf(',', comma1 + 1);
+              if (comma2 <= 0) continue;
+              String tsStr = line.substring(0, comma1);
+              time_t tsTime = parseISO8601(tsStr);
+              if (tsTime < fromTime || tsTime > toTime) continue;
+              String rest = line.substring(comma2 + 1);
+
+              if (!firstPoint) response->print(',');
+              firstPoint = false;
+              response->print("[\""); response->print(tsStr); response->print("\",");
+              response->print(rest);
+              response->print(']');
+              pointCount++;
+            }
+          }
+        }
+        file = dataRoot.openNextFile();
+      }
+      dataRoot.close();
+    }
+
+    response->print("]");
+    response->print(",\"count\":");
+    response->print(pointCount);
+    if (pointCount >= MAX_POINTS) {
+      response->print(",\"warning\":\"Result truncated to 20000 points\"");
+    }
+    response->print("}");
+
+    request->send(response);
+  });
+
+  // /api/download (CSV)
+  server.on("/api/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("from") || !request->hasParam("to")) {
+      request->send(400, "text/plain", "Missing from/to parameters");
+      return;
+    }
+    String fromStr = request->getParam("from")->value();
+    String toStr = request->getParam("to")->value();
+    time_t fromTime = parseISO8601(fromStr);
+    time_t toTime = parseISO8601(toStr);
+    if (fromTime == 0 || toTime == 0) {
+      request->send(400, "text/plain", "Invalid timestamp format");
+      return;
+    }
+
+    String filename = config.device_id + "_" + fromStr.substring(0, 10) + "_" + toStr.substring(0, 10) + ".csv";
+
+    AsyncResponseStream* response = request->beginResponseStream("text/csv");
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+
+    // If SD present, serve SD monthly files; else serve LittleFS ring (RB2 preferred)
+    if (sdPresent) {
+      response->print("timestamp,device_id,t0_c,h0_rh,t1_c,h1_rh,t2_c,h2_rh,t3_c,h3_rh\n");
+      int startYear = 0, startMonth = 0;
+      int endYear = 0, endMonth = 0;
+      normalizeMonthStart(fromTime, startYear, startMonth);
+      normalizeMonthStart(toTime, endYear, endMonth);
+      int year = startYear;
+      int month = startMonth;
+      while (year < endYear || (year == endYear && month <= endMonth)) {
+        String fileName = getLogFilenameForMonth(year, month);
+        File f = SD.open(fileName, FILE_READ);
+        if (f) {
+          String header = f.readStringUntil('\n');
+          if (!header.startsWith("timestamp")) f.seek(0);
+          while (f.available()) {
+            String line = f.readStringUntil('\n');
+            if (line.length() == 0) break;
+            int comma1 = line.indexOf(',');
+            if (comma1 > 0) {
+              String tsStr = line.substring(0, comma1);
+              time_t tsTime = parseISO8601(tsStr);
+              if (tsTime >= fromTime && tsTime <= toTime) {
+                response->print(line); response->print('\n');
+              }
+            }
+          }
+          f.close();
+        }
+        month++;
+        if (month > 12) { month = 1; year++; }
+      }
+    } else {
+      // LittleFS
+      bool headerSent = false;
+      File dlRoot = LittleFS.open("/logs");
+      if (dlRoot && dlRoot.isDirectory()) {
+        File f = dlRoot.openNextFile();
+        while (f) {
+          String name = f.name();
+          if (name.endsWith(".csv")) {
+            f.seek(0);
+            String magic = f.readStringUntil('\n');
+            f.seek(0);
+            size_t dataStart = 0;
+            unsigned long offset = 0;
+            unsigned long count = 0;
+            size_t slots = 0;
+            size_t recordLen = LFS_RING_RECORD_LEN;
+
+            if (magic == "RB2" && lfsRingReadHeaderSparse(f, dataStart, offset, count, slots, recordLen)) {
+              if (!headerSent) {
+                response->print("timestamp,sensor_id,t_c,h_rh\n");
+                headerSent = true;
+              }
+              unsigned long startIndex = (offset + slots - count) % slots;
+              for (unsigned long i = 0; i < count; i++) {
+                unsigned long idx = (startIndex + i) % slots;
+                size_t pos = dataStart + (idx * recordLen);
+                f.seek(pos);
+                char buf[LFS_RING_RECORD_LEN_SPARSE + 1];
+                size_t nread = f.readBytes(buf, recordLen);
+                buf[nread] = '\0';
+                String line = lfsRingTrimRecord(buf, nread);
+                if (line.length() < 20) continue;
+                int c1 = line.indexOf(',');
+                if (c1 <= 0) continue;
+                String tsStr = line.substring(0, c1);
+                time_t tsTime = parseISO8601(tsStr);
+                if (tsTime >= fromTime && tsTime <= toTime) {
+                  response->print(line); response->print('\n');
+                }
+              }
+            }
+          }
+          f = dlRoot.openNextFile();
+        }
+        dlRoot.close();
+      }
+      if (!headerSent) {
+        response->print("timestamp,sensor_id,t_c,h_rh\n");
+      }
+    }
+
+    request->send(response);
+  });
+
+  // /api/prune (Async)
+  server.on("/api/prune", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("days")) {
+      request->send(400, "application/json", "{\"error\":\"Missing days parameter\"}");
+      return;
+    }
+
+    int days = request->getParam("days")->value().toInt();
+    if (days <= 0) {
+      request->send(400, "application/json", "{\"error\":\"Invalid days value\"}");
+      return;
+    }
+
+    time_t now = time(nullptr);
+    if (now < 946684800) {
+      request->send(400, "application/json", "{\"error\":\"Time not set\"}");
+      return;
+    }
+
+    time_t cutoff = now - (time_t)days * 86400;
+
+    int deletedSamples = 0;
+    int keptSamples = 0;
+    int deletedFiles = 0;
+    size_t freedBytes = 0;
+
+    File root = LittleFS.open("/logs");
+    if (!root || !root.isDirectory()) {
+      if (root) root.close();
+      DynamicJsonDocument doc(256);
+      doc["deleted_samples"] = 0;
+      doc["kept_samples"] = 0;
+      doc["deleted_files"] = 0;
+      doc["freed_bytes"] = 0;
+      String out; serializeJson(doc, out);
+      request->send(200, "application/json", out);
+      return;
+    }
+
+    File file = root.openNextFile();
+    while (file) {
+      String fileName = file.name();
+      if (!fileName.endsWith(".csv")) {
+        file = root.openNextFile();
+        continue;
+      }
+      if (!fileName.startsWith("/")) fileName = "/logs/" + fileName;
+
+      size_t originalSize = file.size();
+
+      file.seek(0);
+      String magic = file.readStringUntil('\n');
+      file.seek(0);
+
+      size_t dataStart = 0;
+      unsigned long offset = 0;
+      unsigned long count = 0;
+      size_t slots = 0;
+      size_t recordLen = LFS_RING_RECORD_LEN;
+      bool isSparse = (magic == "RB2");
+      bool isRing = isSparse ? lfsRingReadHeaderSparse(file, dataStart, offset, count, slots, recordLen)
+                             : lfsRingReadHeader(file, dataStart, offset, count, slots, recordLen);
+
+      String tmpName = fileName + ".tmp";
+
+      if (isRing) {
+        File tmp = LittleFS.open(tmpName, "w+");
+        if (!tmp) {
+          file.close();
+          file = root.openNextFile();
+          continue;
+        }
+
+        if (isSparse) lfsRingWriteHeaderSparse(tmp, 0, 0);
+        else if (recordLen >= LFS_RING_RECORD_LEN_EXT) lfsRingWriteHeaderExt(tmp, 0, 0);
+        else lfsRingWriteHeader(tmp, 0, 0);
+
+        size_t tmpDataStart = isSparse ? lfsRingHeaderSizeSparse() : ((recordLen >= LFS_RING_RECORD_LEN_EXT) ? lfsRingHeaderSizeExt() : lfsRingHeaderSize());
+        size_t tmpSlots = lfsRingSlotCount(tmpDataStart, recordLen);
+        if (tmpSlots == 0) {
+          tmp.close();
+          file.close();
+          LittleFS.remove(tmpName);
+          file = root.openNextFile();
+          continue;
+        }
+
+        unsigned long keptInFile = 0;
+        unsigned long startIndex = (offset + slots - count) % slots;
+        for (unsigned long i = 0; i < count; i++) {
+          unsigned long idx = (startIndex + i) % slots;
+          size_t pos = dataStart + (idx * recordLen);
+          file.seek(pos);
+
+          char buf[LFS_RING_RECORD_LEN_EXT + 1];
+          size_t nread = file.readBytes(buf, recordLen);
+          buf[nread] = '\0';
+
+          String line = lfsRingTrimRecord(buf, nread);
+          if (line.length() == 0) continue;
+
+          int comma1 = line.indexOf(',');
+          if (comma1 <= 0) { deletedSamples++; continue; }
+          String tsStr = line.substring(0, comma1);
+          time_t tsTime = parseISO8601(tsStr);
+
+          if (tsTime != 0 && tsTime >= cutoff) {
+            String record = line;
+            if (record.endsWith("\n")) record.remove(record.length() - 1);
+            size_t maxRec = recordLen - 1;
+            if (record.length() > maxRec) record = record.substring(0, maxRec);
+            while (record.length() < maxRec) record += " ";
+            record += "\n";
+
+            size_t wpos = tmpDataStart + (keptInFile * recordLen);
+            tmp.seek(wpos);
+            size_t written = tmp.print(record);
+            if (written != recordLen) break;
+
+            keptSamples++;
+            keptInFile++;
+          } else {
+            deletedSamples++;
+          }
+        }
+
+        unsigned long newCount = keptInFile;
+        unsigned long newOffset = (tmpSlots > 0) ? (newCount % tmpSlots) : 0;
+        if (isSparse) lfsRingWriteHeaderSparse(tmp, newOffset, newCount);
+        else if (recordLen >= LFS_RING_RECORD_LEN_EXT) lfsRingWriteHeaderExt(tmp, newOffset, newCount);
+        else lfsRingWriteHeader(tmp, newOffset, newCount);
+        tmp.flush();
+        tmp.close();
+        file.close();
+
+        if (newCount == 0) {
+          LittleFS.remove(fileName);
+          LittleFS.remove(tmpName);
+          deletedFiles++;
+          freedBytes += originalSize;
+        } else {
+          size_t newSize = 0;
+          File tmpRead = LittleFS.open(tmpName, "r");
+          if (tmpRead) { newSize = tmpRead.size(); tmpRead.close(); }
+          LittleFS.remove(fileName);
+          LittleFS.rename(tmpName, fileName);
+          if (originalSize > newSize) freedBytes += (originalSize - newSize);
+        }
+
+        file = root.openNextFile();
+        continue;
+      }
+
+      // Legacy plain CSV prune (best-effort)
+      File tmp = LittleFS.open(tmpName, "w");
+      if (!tmp) {
+        file.close();
+        file = root.openNextFile();
+        continue;
+      }
+
+      String line = file.readStringUntil('\n');
+      if (line.startsWith("timestamp")) tmp.print(line + "\n");
+      else file.seek(0);
+
+      int fileKept = 0;
+      while (file.available()) {
+        line = file.readStringUntil('\n');
+        if (line.length() == 0) break;
+        int comma1 = line.indexOf(',');
+        if (comma1 <= 0) { deletedSamples++; continue; }
+        String tsStr = line.substring(0, comma1);
+        time_t tsTime = parseISO8601(tsStr);
+        if (tsTime != 0 && tsTime >= cutoff) {
+          tmp.print(line + "\n");
+          keptSamples++;
+          fileKept++;
+        } else {
+          deletedSamples++;
+        }
+      }
+
+      file.close();
+      tmp.flush();
+      tmp.close();
+
+      if (fileKept == 0) {
+        LittleFS.remove(fileName);
+        LittleFS.remove(tmpName);
+        deletedFiles++;
+        freedBytes += originalSize;
+      } else {
+        size_t newSize = 0;
+        File tmpRead = LittleFS.open(tmpName, "r");
+        if (tmpRead) { newSize = tmpRead.size(); tmpRead.close(); }
+        LittleFS.remove(fileName);
+        LittleFS.rename(tmpName, fileName);
+        if (originalSize > newSize) freedBytes += (originalSize - newSize);
+      }
+
+      file = root.openNextFile();
+    }
+
+    root.close();
+
+    DynamicJsonDocument doc(512);
+    doc["deleted_samples"] = deletedSamples;
+    doc["kept_samples"] = keptSamples;
+    doc["deleted_files"] = deletedFiles;
+    doc["freed_bytes"] = freedBytes;
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  // Serve static assets from LittleFS — MUST be after all server.on() routes
+  // so that /api/* and other explicit handlers take priority over the catch-all.
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+
+  server.begin();
+  Serial.println("Async web server started on port 80");
+  Serial.println("Async WebSocket available at ws://192.168.4.1/ws");
   
   // Randomness: use esp_random() directly for tokens/salts (no RNG seeding required)
 
@@ -2688,13 +3298,56 @@ void setup() {
   Serial.println("Current time: " + getISOTimestamp());
   Serial.println("Time set: " + String(config.time_set ? "YES" : "NO"));
   Serial.println("\nDebug: http://192.168.4.1/api/status");
+  // #region agent log
+  Serial.printf("[DBG] setup done: ssid_len=%u ssid='%s' apLastCheckMs=%lu\n", (unsigned)config.ap_ssid.length(), config.ap_ssid.c_str(), apLastCheckMs);
+  // #endregion
 }
 
 void loop() {
-  server.handleClient();
-  ws.loop();
-  
+  // #region agent log
+  static bool firstLoopDump = true;
+  if (firstLoopDump && millis() > 3000) {
+    firstLoopDump = false;
+    Serial.println("=== POST-SETUP DUMP (delayed 3s for USB CDC) ===");
+    Serial.printf("[DBG] ssid_len=%u ssid='%s'\n", (unsigned)config.ap_ssid.length(), config.ap_ssid.c_str());
+    Serial.printf("[DBG] device_id='%s'\n", config.device_id.c_str());
+    Serial.printf("[DBG] wifi_mode=%d ap_ip=%s\n", (int)WiFi.getMode(), WiFi.softAPIP().toString().c_str());
+    Serial.printf("[DBG] heap_free=%u\n", (unsigned)ESP.getFreeHeap());
+  }
+  // #endregion
   unsigned long now = millis();
+
+  // Periodic AP health check + restart with backoff if needed
+  if (now - apLastCheckMs >= 5000) {
+    apLastCheckMs = now;
+    // #region agent log
+    int wifiMode = (int)WiFi.getMode();
+    int staCnt = WiFi.softAPgetStationNum();
+    Serial.printf("[DBG] AP health: mode=%d staCnt=%d ssid_len=%u ssid='%s'\n", wifiMode, staCnt, (unsigned)config.ap_ssid.length(), config.ap_ssid.c_str());
+    // #endregion
+    if (WiFi.getMode() != WIFI_AP || WiFi.softAPgetStationNum() < 0) {
+      // #region agent log
+      Serial.printf("[DBG] AP health TRIGGERED: mode=%d staCnt=%d\n", wifiMode, staCnt);
+      // #endregion
+      if (apRestartAfterMs == 0) apRestartAfterMs = now + apBackoffMs;
+    }
+  }
+  if (apRestartAfterMs != 0 && (long)(now - apRestartAfterMs) >= 0) {
+    if (config.ap_ssid.length() == 0) {
+      Serial.println("[WiFi] AP restart skipped: SSID is empty");
+      apRestartAfterMs = 0;
+    } else {
+      Serial.println("[WiFi] Restarting AP (best-effort)");
+      WiFi.softAPdisconnect(true);
+      delay(50);
+      WiFi.mode(WIFI_AP);
+      WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+      delay(50);
+      WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str(), 6, false, 4);
+      apBackoffMs = (apBackoffMs < 60000UL) ? (apBackoffMs * 2) : 60000UL;
+      apRestartAfterMs = 0;
+    }
+  }
   
   // LED tick (non-blocking)
   ledTick(now);
@@ -2866,20 +3519,20 @@ void loop() {
         }
 
         // Push live sample to WebSocket clients for fast chart updates (independent of storage)
-        DynamicJsonDocument d(256);
-        d["type"] = "sample";
-        d["ts"] = timestamp;
-        d["sensor"] = i;
-        d["t"] = lastT[i];
-        d["h"] = lastH[i];
+        // Avoid heap churn: format tiny JSON manually
         bool hon = false;
         if (i == 0) hon = sht.isHeaterOn();
         else if (i == 1) hon = sht1.isHeaterOn();
         else hon = heater[i].active;
-        d["heater"] = hon;
-        String out;
-        serializeJson(d, out);
-        wsSendJsonToAll(out);
+
+        char buf[256];
+        // ts is ISO8601, numeric values are printed with 2 decimals
+        int n = snprintf(buf, sizeof(buf),
+                         "{\"type\":\"sample\",\"ts\":\"%s\",\"sensor\":%d,\"t\":%.2f,\"h\":%.2f,\"heater\":%s}",
+                         timestamp.c_str(), i, (double)lastT[i], (double)lastH[i], hon ? "true" : "false");
+        if (n > 0 && (size_t)n < sizeof(buf)) {
+          ws.textAll(buf);
+        }
       }
 
       // Optional SD write: writes a full row with last-known values

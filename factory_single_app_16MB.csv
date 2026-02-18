@@ -1,0 +1,10 @@
+# Single-app (no OTA) partition table for 16MB flash
+# - Removes ota_0/ota_1 + otadata
+# - Maximizes LittleFS space for telemetry
+#
+# Name,    Type, SubType,  Offset,    Size,      Flags
+nvs,       data, nvs,      0x9000,    0x5000,
+phy_init,  data, phy,      0xf000,    0x1000,
+factory,   app,  factory,  0x10000,   0x400000,
+spiffs,    data, spiffs,   0x410000,  0xBE0000,
+coredump,  data, coredump, 0xFF0000,  0x10000,

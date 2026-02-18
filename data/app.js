@@ -17,7 +17,7 @@ function setWsBadge(text, ok) {
 
 function wsConnect() {
     try {
-        const url = `ws://${location.hostname}:81/`;
+        const url = `ws://${location.host}/ws`;
         ws = new WebSocket(url);
         setWsBadge('Connecting', false);
 
@@ -170,10 +170,13 @@ function startAutoRefresh(seconds) {
     stopAutoRefresh();
     if (seconds > 0) {
         autoRefreshInterval = setInterval(function() {
-            console.log('Auto-refreshing data...');
-            // Update time range to include new data
+            // If WebSocket live updates are working, avoid re-downloading history.
+            // Only extend the UI "to" timestamp so the range reflects "now".
             document.getElementById('toDate').value = formatDateTimeLocal(new Date());
-            loadData(true); // silent refresh
+            if (!wsConnected) {
+                console.log('Auto-refreshing history (WS not connected)...');
+                loadData(true); // silent refresh
+            }
         }, seconds * 1000);
         
         const btn = document.getElementById('autoRefreshBtn');
@@ -202,6 +205,7 @@ function toggleAutoRefresh() {
     if (autoRefreshInterval) {
         stopAutoRefresh();
     } else {
+        // With WS connected, this only keeps the "to" field current; history reload is skipped.
         startAutoRefresh(30);
     }
 }
@@ -456,17 +460,31 @@ function heatingModeToDurationInterval(mode) {
     return { duration: 0, interval: 0 };
 }
 
+// Derive legacy mode string from duration/interval (used to keep UI consistent)
+function durationIntervalToHeatingMode(duration, interval) {
+    duration = Number(duration) || 0;
+    interval = Number(interval) || 0;
+    if (interval <= 0 || duration <= 0) return 'off';
+    if (interval === 300 && duration === 10) return '10s_5min';
+    if (interval === 3600 && duration === 60) return '1min_1hr';
+    if (interval === 86400 && duration === 60) return '1min_1day';
+    // Unknown/custom values: fall back to off in UI (we no longer support custom duty cycles)
+    return 'off';
+}
+
 // Ensure per-sensor arrays exist (backend may return sample_period_sensor, heating_mode_sensor, heating_duration_sensor, heating_interval_sensor)
 function ensurePerSensorConfig() {
     if (!Array.isArray(deviceConfig.sample_period_sensor)) {
         const single = deviceConfig.sample_period_s || 3600;
         deviceConfig.sample_period_sensor = [single, single, single, single];
     }
-    if (!Array.isArray(deviceConfig.heating_mode_sensor)) {
-        const mode = deviceConfig.heating_mode || 'off';
-        deviceConfig.heating_mode_sensor = [mode, 'off', 'off', 'off'];
-    }
+
     if (!Array.isArray(deviceConfig.heating_duration_sensor) || !Array.isArray(deviceConfig.heating_interval_sensor)) {
+        // Prefer deriving duration/interval from mode if backend didn't send arrays
+        if (!Array.isArray(deviceConfig.heating_mode_sensor)) {
+            const mode = deviceConfig.heating_mode || 'off';
+            deviceConfig.heating_mode_sensor = [mode, 'off', 'off', 'off'];
+        }
         deviceConfig.heating_duration_sensor = [0, 0, 0, 0];
         deviceConfig.heating_interval_sensor = [0, 0, 0, 0];
         for (let i = 0; i < 4; i++) {
@@ -475,6 +493,16 @@ function ensurePerSensorConfig() {
             deviceConfig.heating_duration_sensor[i] = t.duration;
             deviceConfig.heating_interval_sensor[i] = t.interval;
         }
+    }
+
+    // Ensure mode array exists and stays consistent with duration/interval (UI uses mode)
+    if (!Array.isArray(deviceConfig.heating_mode_sensor)) {
+        deviceConfig.heating_mode_sensor = ['off', 'off', 'off', 'off'];
+    }
+    for (let i = 0; i < 4; i++) {
+        const dur = deviceConfig.heating_duration_sensor[i] || 0;
+        const inv = deviceConfig.heating_interval_sensor[i] || 0;
+        deviceConfig.heating_mode_sensor[i] = durationIntervalToHeatingMode(dur, inv);
     }
 }
 
@@ -490,27 +518,9 @@ function closestSamplingOption(sec) {
     return best;
 }
 
-// Enable/disable duty cycle input based on interval selection
-function applyHeatingCycleConstraint(index) {
-    const intervalEl = document.getElementById('sensor' + index + 'HeatingInterval');
-    const dutyCycleEl = document.getElementById('sensor' + index + 'HeatingDutyCycle');
-    if (!intervalEl || !dutyCycleEl) return;
-    const interval = parseInt(intervalEl.value, 10) || 0;
-    dutyCycleEl.disabled = interval === 0;
-    if (interval === 0) {
-        dutyCycleEl.value = 0;
-    } else {
-        let pct = parseInt(dutyCycleEl.value, 10) || 0;
-        if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100;
-        dutyCycleEl.value = pct;
-    }
-}
-
-// Update all sensor option rows (per-sensor sampling + heating interval/duty cycle)
+// Update all sensor option rows (per-sensor sampling + predefined heating mode)
 function updateAllSensorRowSettings() {
     ensurePerSensorConfig();
-    const intervalOptions = [0, 300, 3600, 86400];
     for (let i = 0; i < 4; i++) {
         const sel = document.getElementById('sensor' + i + 'Sampling');
         if (sel) {
@@ -518,19 +528,11 @@ function updateAllSensorRowSettings() {
             sec = closestSamplingOption(sec);
             sel.value = String(sec);
         }
-        const intervalEl = document.getElementById('sensor' + i + 'HeatingInterval');
-        const dutyCycleEl = document.getElementById('sensor' + i + 'HeatingDutyCycle');
-        if (intervalEl) {
-            let inv = deviceConfig.heating_interval_sensor[i] || 0;
-            intervalEl.value = intervalOptions.indexOf(inv) >= 0 ? String(inv) : '0';
+        const heatModeEl = document.getElementById('sensor' + i + 'HeatingMode');
+        if (heatModeEl) {
+            const m = deviceConfig.heating_mode_sensor[i] || 'off';
+            heatModeEl.value = m;
         }
-        if (dutyCycleEl) {
-            const dur = deviceConfig.heating_duration_sensor[i] || 0;
-            const inv = deviceConfig.heating_interval_sensor[i] || 0;
-            const pct = (inv > 0) ? Math.round(dur / inv * 100) : 0;
-            dutyCycleEl.value = pct;
-        }
-        applyHeatingCycleConstraint(i);
     }
 }
 
@@ -629,7 +631,7 @@ async function loadStorageStatus() {
             const lfs = data.lfs;
             const sd = data.sd;
 
-            let statusText = `LFS: ${formatBytes(lfs.free)} free`;
+            let statusText = `LFS: ${formatBytes(lfs.used)} used / ${formatBytes(lfs.total)} (free ${formatBytes(lfs.free)})`;
             if (sd.present) {
                 statusText += ` | SD: OK`;
             }
@@ -1014,34 +1016,27 @@ async function saveSensorSampling(index) {
     }
 }
 
-// When heating interval changes: update constraint and save (duty cycle % is preserved)
-function onHeatingIntervalChange(index) {
-    applyHeatingCycleConstraint(index);
-    saveSensorHeating(index);
-}
-
-// Save one sensor's heating (duty cycle % + interval); computes duration from pct and sends to API
-async function saveSensorHeating(index) {
+// Save one sensor's heating mode (predefined)
+async function saveSensorHeatingMode(index) {
     ensurePerSensorConfig();
-    const intervalEl = document.getElementById('sensor' + index + 'HeatingInterval');
-    const dutyCycleEl = document.getElementById('sensor' + index + 'HeatingDutyCycle');
-    if (!intervalEl || !dutyCycleEl) return;
-    let interval = parseInt(intervalEl.value, 10) || 0;
-    let pct = parseInt(dutyCycleEl.value, 10) || 0;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    let duration = (interval > 0) ? Math.round(interval * pct / 100) : 0;
-    if (interval === 0) duration = 0;
+    const el = document.getElementById('sensor' + index + 'HeatingMode');
+    if (!el) return;
+    const mode = String(el.value || 'off');
+
+    const t = heatingModeToDurationInterval(mode);
     const durationArr = deviceConfig.heating_duration_sensor.slice();
     const intervalArr = deviceConfig.heating_interval_sensor.slice();
-    durationArr[index] = duration;
-    intervalArr[index] = interval;
+    durationArr[index] = t.duration;
+    intervalArr[index] = t.interval;
+
     // Prefer WebSocket for instant UI feel; fallback to HTTP
     if (wsSend({ type: 'set', heating_duration_sensor: durationArr, heating_interval_sensor: intervalArr })) {
         deviceConfig.heating_duration_sensor = durationArr;
         deviceConfig.heating_interval_sensor = intervalArr;
+        deviceConfig.heating_mode_sensor[index] = mode;
         return;
     }
+
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
@@ -1055,10 +1050,11 @@ async function saveSensorHeating(index) {
         if (response.ok && data.success) {
             deviceConfig.heating_duration_sensor = durationArr;
             deviceConfig.heating_interval_sensor = intervalArr;
+            deviceConfig.heating_mode_sensor[index] = mode;
             updateLiveStatus();
         }
     } catch (error) {
-        console.error('Failed to save sensor heating:', error);
+        console.error('Failed to save sensor heating mode:', error);
     }
 }
 

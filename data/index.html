@@ -75,15 +75,13 @@
                         <option value="21600">6 h</option>
                         <option value="86400">24 h</option>
                     </select>
-                    <span class="sensor-options-label">Heat interval:</span>
-                    <select id="sensor0HeatingInterval" onchange="onHeatingIntervalChange(0)">
-                        <option value="0">Off</option>
-                        <option value="300">5 min</option>
-                        <option value="3600">1 h</option>
-                        <option value="86400">24 h</option>
+                    <span class="sensor-options-label">Heating:</span>
+                    <select id="sensor0HeatingMode" onchange="saveSensorHeatingMode(0)">
+                        <option value="off">Off</option>
+                        <option value="10s_5min">10 s every 5 min</option>
+                        <option value="1min_1hr">1 min every 60 min</option>
+                        <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <span class="sensor-options-label">Duty cycle (%):</span>
-                    <input type="number" id="sensor0HeatingDutyCycle" min="0" max="100" value="0" style="width:4em" onchange="saveSensorHeating(0)">
                     <button type="button" onclick="downloadCSV(0)" class="btn-small">Download CSV</button>
                 </div>
             </div>
@@ -109,15 +107,13 @@
                         <option value="21600">6 h</option>
                         <option value="86400">24 h</option>
                     </select>
-                    <span class="sensor-options-label">Heat interval:</span>
-                    <select id="sensor1HeatingInterval" onchange="onHeatingIntervalChange(1)">
-                        <option value="0">Off</option>
-                        <option value="300">5 min</option>
-                        <option value="3600">1 h</option>
-                        <option value="86400">24 h</option>
+                    <span class="sensor-options-label">Heating:</span>
+                    <select id="sensor1HeatingMode" onchange="saveSensorHeatingMode(1)">
+                        <option value="off">Off</option>
+                        <option value="10s_5min">10 s every 5 min</option>
+                        <option value="1min_1hr">1 min every 60 min</option>
+                        <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <span class="sensor-options-label">Duty cycle (%):</span>
-                    <input type="number" id="sensor1HeatingDutyCycle" min="0" max="100" value="0" style="width:4em" onchange="saveSensorHeating(1)">
                     <button type="button" onclick="downloadCSV(1)" class="btn-small">Download CSV</button>
                 </div>
             </div>
@@ -143,15 +139,13 @@
                         <option value="21600">6 h</option>
                         <option value="86400">24 h</option>
                     </select>
-                    <span class="sensor-options-label">Heat interval:</span>
-                    <select id="sensor2HeatingInterval" onchange="onHeatingIntervalChange(2)">
-                        <option value="0">Off</option>
-                        <option value="300">5 min</option>
-                        <option value="3600">1 h</option>
-                        <option value="86400">24 h</option>
+                    <span class="sensor-options-label">Heating:</span>
+                    <select id="sensor2HeatingMode" onchange="saveSensorHeatingMode(2)">
+                        <option value="off">Off</option>
+                        <option value="10s_5min">10 s every 5 min</option>
+                        <option value="1min_1hr">1 min every 60 min</option>
+                        <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <span class="sensor-options-label">Duty cycle (%):</span>
-                    <input type="number" id="sensor2HeatingDutyCycle" min="0" max="100" value="0" style="width:4em" onchange="saveSensorHeating(2)">
                     <button type="button" onclick="downloadCSV(2)" class="btn-small">Download CSV</button>
                 </div>
             </div>
@@ -177,15 +171,13 @@
                         <option value="21600">6 h</option>
                         <option value="86400">24 h</option>
                     </select>
-                    <span class="sensor-options-label">Heat interval:</span>
-                    <select id="sensor3HeatingInterval" onchange="onHeatingIntervalChange(3)">
-                        <option value="0">Off</option>
-                        <option value="300">5 min</option>
-                        <option value="3600">1 h</option>
-                        <option value="86400">24 h</option>
+                    <span class="sensor-options-label">Heating:</span>
+                    <select id="sensor3HeatingMode" onchange="saveSensorHeatingMode(3)">
+                        <option value="off">Off</option>
+                        <option value="10s_5min">10 s every 5 min</option>
+                        <option value="1min_1hr">1 min every 60 min</option>
+                        <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <span class="sensor-options-label">Duty cycle (%):</span>
-                    <input type="number" id="sensor3HeatingDutyCycle" min="0" max="100" value="0" style="width:4em" onchange="saveSensorHeating(3)">
                     <button type="button" onclick="downloadCSV(3)" class="btn-small">Download CSV</button>
                 </div>
             </div>
