@@ -7,6 +7,12 @@ let statusRefreshInterval = null;
 
 let ws = null;
 let wsConnected = false;
+let wsRetryMs = 500; // exponential backoff for reconnects
+
+let dataLoadAbort = null; // AbortController for /api/data
+let dataLoadInFlight = false;
+
+const MAX_CHART_POINTS = 50; // max data points shown per sensor chart
 
 function setWsBadge(text, ok) {
     const el = document.getElementById('wsStatus');
@@ -23,6 +29,7 @@ function wsConnect() {
 
         ws.onopen = () => {
             wsConnected = true;
+            wsRetryMs = 500; // reset backoff on success
             setWsBadge('OK', true);
             console.log('[WS] connected');
         };
@@ -30,9 +37,9 @@ function wsConnect() {
         ws.onclose = () => {
             wsConnected = false;
             setWsBadge('Closed', false);
-            console.log('[WS] closed, retrying');
-            // retry
-            setTimeout(wsConnect, 1000);
+            console.log('[WS] closed, retrying in', wsRetryMs, 'ms');
+            setTimeout(wsConnect, wsRetryMs);
+            wsRetryMs = Math.min(30000, wsRetryMs * 2);
         };
 
         ws.onerror = () => {
@@ -55,24 +62,46 @@ function wsConnect() {
                     if (deviceConfig.sample_period_sensor) deviceConfig.sample_period_s = deviceConfig.sample_period_sensor[0];
                     updateAllSensorRowSettings();
                 } else if (msg.type === 'sample') {
-                    // console.log('[WS] sample', msg);
-                    // fast chart append
+                    // Back-compat (older firmware): one sensor per message
                     const s = Number(msg.sensor);
                     const ts = new Date(msg.ts).getTime();
                     const t = Number(msg.t);
                     const h = Number(msg.h);
                     if (Number.isFinite(s) && s >= 0 && s < 4 && Number.isFinite(ts)) {
-                        const MAX_LIVE_POINTS = 2000; // avoid unbounded growth
                         if (Number.isFinite(t) && tempCharts[s]) {
                             const cur = tempCharts[s].w.config.series[0].data || [];
                             cur.push([ts, t]);
-                            if (cur.length > MAX_LIVE_POINTS) cur.splice(0, cur.length - MAX_LIVE_POINTS);
+                            if (cur.length > MAX_CHART_POINTS) cur.splice(0, cur.length - MAX_CHART_POINTS);
                             tempCharts[s].updateSeries([{ name: 'Temperature', data: cur }], false);
                         }
                         if (Number.isFinite(h) && humCharts[s]) {
                             const cur = humCharts[s].w.config.series[0].data || [];
                             cur.push([ts, h]);
-                            if (cur.length > MAX_LIVE_POINTS) cur.splice(0, cur.length - MAX_LIVE_POINTS);
+                            if (cur.length > MAX_CHART_POINTS) cur.splice(0, cur.length - MAX_CHART_POINTS);
+                            humCharts[s].updateSeries([{ name: 'Humidity', data: cur }], false);
+                        }
+                    }
+                } else if (msg.type === 'sample4') {
+                    // New firmware: batched samples for all sensors (max ~1 Hz)
+                    const ts = new Date(msg.ts).getTime();
+                    if (!Number.isFinite(ts)) return;
+                    const tArr = Array.isArray(msg.t) ? msg.t : [];
+                    const hArr = Array.isArray(msg.h) ? msg.h : [];
+                    const upd = Array.isArray(msg.updated) ? msg.updated : [true, true, true, true];
+                    for (let s = 0; s < 4; s++) {
+                        if (upd[s] === false) continue; // only append for sensors read this cycle
+                        const t = Number(tArr[s]);
+                        const h = Number(hArr[s]);
+                        if (Number.isFinite(t) && tempCharts[s]) {
+                            const cur = tempCharts[s].w.config.series[0].data || [];
+                            cur.push([ts, t]);
+                            if (cur.length > MAX_CHART_POINTS) cur.splice(0, cur.length - MAX_CHART_POINTS);
+                            tempCharts[s].updateSeries([{ name: 'Temperature', data: cur }], false);
+                        }
+                        if (Number.isFinite(h) && humCharts[s]) {
+                            const cur = humCharts[s].w.config.series[0].data || [];
+                            cur.push([ts, h]);
+                            if (cur.length > MAX_CHART_POINTS) cur.splice(0, cur.length - MAX_CHART_POINTS);
                             humCharts[s].updateSeries([{ name: 'Humidity', data: cur }], false);
                         }
                     }
@@ -104,20 +133,26 @@ document.addEventListener('DOMContentLoaded', function() {
     loadStorageStatus();
     checkTimeStatus();
     wsConnect();
-    
-    // Set default time range and auto-load data (7 days to catch device time drift)
-    setQuickRange(7, true);
-    
+
+    // Default: show recent stored points quickly without stressing /api/data on boot.
+    // (Full history can be loaded via the Load button.)
+    const to = new Date();
+    const from = new Date();
+    from.setHours(from.getHours() - 6);
+    document.getElementById('fromDate').value = formatDateTimeLocal(from);
+    document.getElementById('toDate').value = formatDateTimeLocal(to);
+    setTimeout(() => loadRecent(MAX_CHART_POINTS, true), 1200);
+
     // Start live status updates (every 5 seconds)
     updateLiveStatus();
     statusRefreshInterval = setInterval(function() {
         updateLiveStatus();
     }, 5000);
     console.log('Live status updates started (5s interval)');
-    
-    // Start auto-refresh for charts (every 30 seconds)
-    startAutoRefresh(30);
-    console.log('Auto-refresh started (30s interval)');
+
+    // Auto-refresh is OFF by default (WS live updates should keep charts moving).
+    // User can toggle Auto: 1s or Auto: 30s.
+    stopAutoRefresh();
 });
 
 // Live status update
@@ -166,19 +201,27 @@ async function updateLiveStatus() {
 }
 
 // Auto-refresh control
+// Modes cycle: Off -> 1s -> 30s -> Off
 function startAutoRefresh(seconds) {
     stopAutoRefresh();
     if (seconds > 0) {
         autoRefreshInterval = setInterval(function() {
-            // If WebSocket live updates are working, avoid re-downloading history.
-            // Only extend the UI "to" timestamp so the range reflects "now".
-            document.getElementById('toDate').value = formatDateTimeLocal(new Date());
-            if (!wsConnected) {
+            // Keep the "to" timestamp moving so the selected range includes "now"
+            const toEl = document.getElementById('toDate');
+            if (toEl) toEl.value = formatDateTimeLocal(new Date());
+
+            // 1s mode: do NOT hammer /api/data (it can be expensive and can trigger async_tcp WDT).
+            // Instead, keep UI alive via /api/status polling when WS is not connected.
+            if (seconds <= 1) {
+                if (!wsConnected) {
+                    updateLiveStatus();
+                }
+            } else if (!wsConnected) {
                 console.log('Auto-refreshing history (WS not connected)...');
-                loadData(true); // silent refresh
+                loadData(true);
             }
         }, seconds * 1000);
-        
+
         const btn = document.getElementById('autoRefreshBtn');
         if (btn) {
             btn.textContent = `Auto: ${seconds}s`;
@@ -202,11 +245,14 @@ function stopAutoRefresh() {
 }
 
 function toggleAutoRefresh() {
-    if (autoRefreshInterval) {
-        stopAutoRefresh();
-    } else {
-        // With WS connected, this only keeps the "to" field current; history reload is skipped.
+    const btn = document.getElementById('autoRefreshBtn');
+    const cur = btn ? btn.textContent : '';
+    if (cur.indexOf('Off') >= 0) {
+        startAutoRefresh(1);
+    } else if (cur.indexOf('1s') >= 0) {
         startAutoRefresh(30);
+    } else {
+        stopAutoRefresh();
     }
 }
 
@@ -684,44 +730,6 @@ function formatDuration(seconds) {
     return minutes + ' min';
 }
 
-async function pruneLfs() {
-    const input = document.getElementById('pruneDays');
-    const btn = document.getElementById('pruneBtn');
-    if (!input || !btn) return;
-
-    const days = parseInt(input.value, 10);
-    if (!Number.isFinite(days) || days <= 0) {
-        alert('Please enter a valid number of days');
-        return;
-    }
-
-    if (!confirm(`Delete LittleFS data older than ${days} days?`)) {
-        return;
-    }
-
-    btn.disabled = true;
-    const oldLabel = btn.textContent;
-    btn.textContent = 'Pruning...';
-
-    try {
-        const response = await fetch(`/api/prune?days=${encodeURIComponent(days)}`);
-        const data = await response.json();
-        if (!response.ok) {
-            throw new Error(data.error || 'Prune failed');
-        }
-
-        alert(`Deleted ${data.deleted_samples} samples, freed ${formatBytes(data.freed_bytes)}`);
-        loadStorageStatus();
-        loadData(true);
-    } catch (error) {
-        console.error('Failed to prune LFS:', error);
-        alert('Failed to prune: ' + error.message);
-    } finally {
-        btn.disabled = false;
-        btn.textContent = oldLabel;
-    }
-}
-
 // Check time status
 async function checkTimeStatus() {
     try {
@@ -803,6 +811,74 @@ function formatISO8601(date) {
     return date.toISOString().split('.')[0] + 'Z';
 }
 
+// Load recent stored points (fast path, no time filtering)
+async function loadRecent(n = MAX_CHART_POINTS, silent = false) {
+    try {
+        if (dataLoadInFlight && dataLoadAbort) {
+            try { dataLoadAbort.abort(); } catch (e) {}
+        }
+        dataLoadAbort = new AbortController();
+        dataLoadInFlight = true;
+
+        const response = await fetch(`/api/recent?n=${encodeURIComponent(n)}`,
+                                     { signal: dataLoadAbort.signal });
+        if (!response.ok) throw new Error('Failed to load recent data');
+        const data = await response.json();
+
+        const tempDataBySensor = [[], [], [], []];
+        const humDataBySensor = [[], [], [], []];
+
+        if (data.points && Array.isArray(data.points)) {
+            for (let i = 0; i < data.points.length; i++) {
+                const point = data.points[i];
+                if (!point || point.length < 3) continue;
+                const timestamp = new Date(point[0]).getTime();
+                const numVal = point.length >= 9 ? 4 : 1;
+                for (let s = 0; s < numVal; s++) {
+                    const ti = s * 2 + 1;
+                    const hi = s * 2 + 2;
+                    const tv = point[ti];
+                    const hv = point[hi];
+                    if (tv != null && hv != null && tv !== 'null' && hv !== 'null') {
+                        const tn = Number(tv);
+                        const hn = Number(hv);
+                        if (Number.isFinite(tn) && Number.isFinite(hn)) {
+                            tempDataBySensor[s].push([timestamp, tn]);
+                            humDataBySensor[s].push([timestamp, hn]);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (let s = 0; s < 4; s++) {
+            tempDataBySensor[s].sort((a, b) => a[0] - b[0]);
+            humDataBySensor[s].sort((a, b) => a[0] - b[0]);
+            if (tempDataBySensor[s].length > MAX_CHART_POINTS)
+                tempDataBySensor[s] = tempDataBySensor[s].slice(-MAX_CHART_POINTS);
+            if (humDataBySensor[s].length > MAX_CHART_POINTS)
+                humDataBySensor[s] = humDataBySensor[s].slice(-MAX_CHART_POINTS);
+        }
+
+        for (let s = 0; s < 4; s++) {
+            if (tempCharts[s]) tempCharts[s].updateSeries([{ name: 'Temperature', data: tempDataBySensor[s] }]);
+            if (humCharts[s]) humCharts[s].updateSeries([{ name: 'Humidity', data: humDataBySensor[s] }]);
+        }
+
+        const countEl = document.getElementById('dataCount');
+        if (countEl) {
+            const count = Number.isFinite(data.count) ? data.count : (data.points && data.points.length) || 0;
+            countEl.textContent = `${count} points`;
+        }
+    } catch (error) {
+        if (error && error.name === 'AbortError') return;
+        console.error('Failed to load recent data:', error);
+        if (!silent) alert('Failed to load recent data: ' + error.message);
+    } finally {
+        dataLoadInFlight = false;
+    }
+}
+
 // Load data (silent = no alerts)
 async function loadData(silent = false) {
     const fromInput = document.getElementById('fromDate').value;
@@ -824,13 +900,26 @@ async function loadData(silent = false) {
     try {
         const fromISO = formatISO8601(from);
         const toISO = formatISO8601(to);
-        
-        const response = await fetch(`/api/data?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`);
-        
+
+        // Ensure only one /api/data request at a time (avoid piling up requests and wedging the device)
+        if (dataLoadInFlight && dataLoadAbort) {
+            try { dataLoadAbort.abort(); } catch (e) {}
+        }
+        dataLoadAbort = new AbortController();
+        dataLoadInFlight = true;
+
+        let response;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            response = await fetch(`/api/data?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}`,
+                                   { signal: dataLoadAbort.signal });
+            if (response.status !== 503) break;
+            await new Promise(r => setTimeout(r, 500 + attempt * 500));
+        }
+
         if (!response.ok) {
             throw new Error('Failed to load data');
         }
-        
+
         const data = await response.json();
         
         if (data.warning && !silent) {
@@ -868,6 +957,15 @@ async function loadData(silent = false) {
                 humDataBySensor[0].push([timestamp, data.hum[i]]);
             }
         }
+        for (let s = 0; s < 4; s++) {
+            tempDataBySensor[s].sort((a, b) => a[0] - b[0]);
+            humDataBySensor[s].sort((a, b) => a[0] - b[0]);
+            if (tempDataBySensor[s].length > MAX_CHART_POINTS)
+                tempDataBySensor[s] = tempDataBySensor[s].slice(-MAX_CHART_POINTS);
+            if (humDataBySensor[s].length > MAX_CHART_POINTS)
+                humDataBySensor[s] = humDataBySensor[s].slice(-MAX_CHART_POINTS);
+        }
+
         let firstTs = null;
         let lastTs = null;
         if (tempDataBySensor[0].length > 0) {
@@ -891,12 +989,22 @@ async function loadData(silent = false) {
         }
         
     } catch (error) {
+        // Abort is expected when user clicks Load repeatedly or auto-refresh changes range
+        if (error && error.name === 'AbortError') {
+            return;
+        }
         console.error('Failed to load data:', error);
         if (!silent) alert('Failed to load data: ' + error.message);
+    } finally {
+        dataLoadInFlight = false;
     }
 }
 
+// Chunk size for CSV download; must match server DOWNLOAD_CHUNK_LINES to avoid WDT on large sends.
+const DOWNLOAD_CHUNK_LINES = 500;
+
 // Download CSV. If sensorIndex is 0..3, fetch and save only that sensor's columns; otherwise full CSV via navigation.
+// Uses chunked fetches (offset/limit) so large exports do not trigger device WDT.
 async function downloadCSV(sensorIndex) {
     const fromInput = document.getElementById('fromDate').value;
     const toInput = document.getElementById('toDate').value;
@@ -916,23 +1024,50 @@ async function downloadCSV(sensorIndex) {
     
     const fromISO = formatISO8601(from);
     const toISO = formatISO8601(to);
-    const url = `/api/download?from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&format=csv&store=auto`;
-    
+    const baseParams = `from=${encodeURIComponent(fromISO)}&to=${encodeURIComponent(toISO)}&format=csv&store=auto`;
+    const urlOneShot = `/api/download?${baseParams}`;
+
     if (sensorIndex === undefined || sensorIndex === null) {
-        window.location.href = url;
+        window.location.href = urlOneShot;
         return;
     }
     
     const idx = parseInt(sensorIndex, 10);
     if (idx < 0 || idx > 3) {
-        window.location.href = url;
+        window.location.href = urlOneShot;
         return;
     }
     
+    const statusEl = document.getElementById('dataCount');
+    const origText = statusEl ? statusEl.textContent : '';
     try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('Download failed');
-        const fullCsv = await response.text();
+        if (statusEl) statusEl.textContent = 'Downloading CSV...';
+
+        let fullCsv = '';
+        let offset = 0;
+        let more = true;
+        while (more) {
+            let response;
+            const chunkUrl = `/api/download?${baseParams}&offset=${offset}&limit=${DOWNLOAD_CHUNK_LINES}`;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                response = await fetch(chunkUrl);
+                if (response.status !== 503) break;
+                if (statusEl) statusEl.textContent = 'FS busy, retrying...';
+                await new Promise(r => setTimeout(r, 1000 + attempt * 1000));
+            }
+            if (!response.ok) throw new Error('Download failed (' + response.status + ')');
+            const chunk = await response.text();
+            fullCsv += chunk;
+            const xMore = response.headers.get('X-More');
+            const lines = chunk.split(/\r?\n/).filter(l => l.length > 0);
+            const dataLines = (offset === 0 ? Math.max(0, lines.length - 1) : lines.length);
+            more = (xMore === '1') || (dataLines >= DOWNLOAD_CHUNK_LINES);
+            // Server interprets offset as "number of matching data rows to skip".
+            // So we must advance by how many data rows we actually received (not by the requested limit),
+            // otherwise we can skip rows when the device returns a short chunk.
+            offset += dataLines;
+            if (statusEl && more) statusEl.textContent = `Downloading CSV... ${offset} rows`;
+        }
         const lines = fullCsv.split(/\r?\n/);
         if (lines.length === 0) {
             alert('No data in range');
@@ -967,9 +1102,148 @@ async function downloadCSV(sensorIndex) {
         a.download = (deviceConfig.device_id || 'logger') + '_' + fromISO.substring(0, 10) + '_' + toISO.substring(0, 10) + '_sensor' + idx + '.csv';
         a.click();
         URL.revokeObjectURL(a.href);
+        if (statusEl) statusEl.textContent = origText;
     } catch (error) {
+        if (statusEl) statusEl.textContent = origText;
         console.error('Failed to download CSV:', error);
         alert('Failed to download CSV: ' + error.message);
+    }
+}
+
+// Download ALL data for one sensor (requires SD). This streams a pre-filtered CSV from the device
+// so the browser doesn't need to concatenate huge files in memory.
+function downloadAllSensor(sensorIndex) {
+    const idx = parseInt(sensorIndex, 10);
+    if (!Number.isFinite(idx) || idx < 0 || idx > 3) {
+        alert('Invalid sensor');
+        return;
+    }
+    // LittleFS export endpoint: streams full-history per-sensor CSV.
+    window.location.href = `/api/lfs/export?sensor=${idx}`;
+}
+
+// ---- Storage Manager UI ----
+function openStorageManager() {
+    const modal = document.getElementById('storageModal');
+    if (!modal) return;
+    modal.classList.add('show');
+    refreshStorageManager();
+}
+
+function closeStorageManager() {
+    const modal = document.getElementById('storageModal');
+    if (!modal) return;
+    modal.classList.remove('show');
+}
+
+async function refreshStorageManager() {
+    const statusEl = document.getElementById('sdFilesStatus');
+    const listEl = document.getElementById('sdFilesList');
+    const pruneEl = document.getElementById('pruneStatus');
+    if (statusEl) statusEl.textContent = 'LittleFS logs: loading...';
+    if (listEl) listEl.innerHTML = '';
+    if (pruneEl) pruneEl.textContent = '';
+
+    try {
+        const res = await fetch('/api/files');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const files = (data && Array.isArray(data.files)) ? data.files : [];
+
+        if (statusEl) statusEl.textContent = `LittleFS logs: ${files.length} file(s)`;
+
+        if (!listEl) return;
+        if (files.length === 0) {
+            listEl.innerHTML = '<div class="small-muted">No /logs/*.csv files found in LittleFS.</div>';
+            return;
+        }
+
+        listEl.innerHTML = files.map(f => {
+            const name = (f && f.name) ? String(f.name) : '';
+            const size = (f && typeof f.size === 'number') ? f.size : null;
+            const sizeStr = (size === null) ? '' : ` (${formatBytes(size)})`;
+            const safe = name.replace(/"/g, '');
+            return `
+              <div class="file-row">
+                <input type="checkbox" class="lfs-file-cb" data-name="${safe}">
+                <code>${safe}</code><span class="sensor-options-muted">${sizeStr}</span>
+              </div>`;
+        }).join('');
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'LittleFS logs: error';
+        if (listEl) listEl.innerHTML = '<div class="small-muted">Failed to load LittleFS file list.</div>';
+    }
+}
+
+async function deleteSelectedLfsFiles() {
+    const listEl = document.getElementById('sdFilesList');
+    if (!listEl) return;
+    const cbs = Array.from(listEl.querySelectorAll('.lfs-file-cb'));
+    const selected = cbs.filter(cb => cb.checked).map(cb => cb.getAttribute('data-name')).filter(Boolean);
+
+    if (selected.length === 0) {
+        alert('Select at least one LittleFS file to delete.');
+        return;
+    }
+
+    if (!confirm(`Delete ${selected.length} LittleFS log file(s)? This cannot be undone.`)) return;
+
+    for (const name of selected) {
+        try {
+            const res = await fetch('/api/lfs/delete?name=' + encodeURIComponent(name));
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.success) {
+                throw new Error((data && data.error) ? data.error : 'delete failed');
+            }
+        } catch (e) {
+            alert('Failed to delete ' + name + ': ' + e.message);
+            break;
+        }
+    }
+
+    await refreshStorageManager();
+    loadStorageStatus();
+}
+
+async function clearLittleFsLogs() {
+    if (!confirm('Clear ALL LittleFS logs? This will delete /logs/*.csv and cannot be undone.')) return;
+    try {
+        const res = await fetch('/api/lfs/clear');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+            throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
+        }
+        alert(`Cleared logs: deleted_files=${data.deleted_files || 0}`);
+    } catch (e) {
+        alert('Clear failed: ' + e.message);
+    }
+    await refreshStorageManager();
+    loadStorageStatus();
+}
+
+async function pruneLittleFs() {
+    const daysEl = document.getElementById('pruneDays');
+    const statusEl = document.getElementById('pruneStatus');
+    const days = daysEl ? parseInt(daysEl.value, 10) : 0;
+    if (!Number.isFinite(days) || days <= 0) {
+        alert('Enter a valid number of days.');
+        return;
+    }
+    if (!confirm(`Delete LittleFS samples older than ${days} day(s)?`)) return;
+
+    if (statusEl) statusEl.textContent = 'Pruning...';
+    try {
+        const res = await fetch('/api/prune?days=' + encodeURIComponent(String(days)));
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            throw new Error(data.error || ('HTTP ' + res.status));
+        }
+        if (statusEl) {
+            statusEl.textContent = `Prune done: deleted_samples=${data.deleted_samples || 0}, kept_samples=${data.kept_samples || 0}, freed=${formatBytes(data.freed_bytes || 0)}`;
+        }
+        loadStorageStatus();
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Prune failed: ' + e.message;
     }
 }
 

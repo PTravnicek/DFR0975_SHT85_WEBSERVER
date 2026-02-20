@@ -21,11 +21,6 @@
                 </div>
                 <div class="retention-bar">
                     <span id="capacityStatus" class="status-badge">Capacity: --</span>
-                    <div class="retention-controls">
-                        <label>Prune days:</label>
-                        <input type="number" id="pruneDays" min="1" value="30">
-                        <button id="pruneBtn" onclick="pruneLfs()" class="btn-secondary">Prune</button>
-                    </div>
                 </div>
             </div>
         </header>
@@ -46,7 +41,8 @@
             </div>
             <div class="actions">
                 <button onclick="loadData()" class="btn-primary">Load</button>
-                <button onclick="toggleAutoRefresh()" id="autoRefreshBtn" class="btn-secondary">Auto: 30s</button>
+                <button onclick="toggleAutoRefresh()" id="autoRefreshBtn" class="btn-secondary">Auto: Off</button>
+                <button onclick="openStorageManager()" class="btn-secondary">Storage</button>
                 <span id="wsStatus" class="status-badge">WS: --</span>
                 <span id="dataCount" class="data-count">0 points</span>
             </div>
@@ -83,6 +79,7 @@
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
                     <button type="button" onclick="downloadCSV(0)" class="btn-small">Download CSV</button>
+                    <button type="button" onclick="downloadAllSensor(0)" class="btn-small btn-strong">Download ALL (S0)</button>
                 </div>
             </div>
             <div class="chart-row">
@@ -115,6 +112,7 @@
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
                     <button type="button" onclick="downloadCSV(1)" class="btn-small">Download CSV</button>
+                    <button type="button" onclick="downloadAllSensor(1)" class="btn-small btn-strong">Download ALL (S1)</button>
                 </div>
             </div>
             <div class="chart-row">
@@ -147,6 +145,7 @@
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
                     <button type="button" onclick="downloadCSV(2)" class="btn-small">Download CSV</button>
+                    <button type="button" onclick="downloadAllSensor(2)" class="btn-small btn-strong">Download ALL (S2)</button>
                 </div>
             </div>
             <div class="chart-row">
@@ -179,6 +178,7 @@
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
                     <button type="button" onclick="downloadCSV(3)" class="btn-small">Download CSV</button>
+                    <button type="button" onclick="downloadAllSensor(3)" class="btn-small btn-strong">Download ALL (S3)</button>
                 </div>
             </div>
         </div>
@@ -207,6 +207,38 @@
                 </div>
             </form>
             <div id="settingsError" class="error-message"></div>
+        </div>
+    </div>
+
+    <!-- Storage Manager Modal -->
+    <div id="storageModal" class="modal">
+        <div class="modal-content">
+            <h2>Storage Manager</h2>
+
+            <div class="form-group">
+                <div class="storage-actions">
+                    <button type="button" onclick="refreshStorageManager()" class="btn-secondary">Refresh</button>
+                    <button type="button" onclick="deleteSelectedLfsFiles()" class="btn-danger">Delete selected LittleFS files</button>
+                    <button type="button" onclick="clearLittleFsLogs()" class="btn-danger">Clear ALL LittleFS logs</button>
+                </div>
+                <div id="sdFilesStatus" class="small-muted">LittleFS logs: --</div>
+                <div id="sdFilesList" class="file-list"></div>
+            </div>
+
+            <hr class="divider" />
+
+            <div class="form-group">
+                <label>Free space (LittleFS): delete samples older than N days</label>
+                <div class="storage-actions">
+                    <input type="number" id="pruneDays" min="1" value="30" style="width:90px" />
+                    <button type="button" onclick="pruneLittleFs()" class="btn-danger">Prune</button>
+                </div>
+                <div id="pruneStatus" class="small-muted"></div>
+            </div>
+
+            <div class="form-actions">
+                <button type="button" onclick="closeStorageManager()" class="btn-secondary">Close</button>
+            </div>
         </div>
     </div>
 

@@ -73,26 +73,6 @@ body {
     margin-top: 10px;
 }
 
-.retention-controls {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    flex-wrap: wrap;
-}
-
-.retention-controls label {
-    font-size: 14px;
-    text-transform: uppercase;
-}
-
-.retention-controls input[type="number"] {
-    width: 80px;
-    padding: 6px 8px;
-    border: 3px solid #000;
-    font-family: 'ModernDOS', monospace;
-    font-size: 14px;
-}
-
 .status-badge {
     padding: 6px 12px;
     font-size: 16px;
@@ -298,6 +278,57 @@ button:hover {
 .btn-small:hover {
     background: #000;
     color: #fff;
+}
+
+.btn-strong {
+    border-color: #0a0;
+    color: #0a0;
+}
+
+.btn-danger {
+    border-color: #c00;
+    color: #c00;
+}
+
+.small-muted {
+    margin-top: 8px;
+    font-size: 12px;
+    opacity: 0.8;
+}
+
+.divider {
+    border: 0;
+    border-top: 2px dashed #000;
+    margin: 16px 0;
+    opacity: 0.6;
+}
+
+.storage-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.file-list {
+    margin-top: 10px;
+    max-height: 240px;
+    overflow: auto;
+    padding: 8px;
+    border: 2px dashed #000;
+    background: #fff;
+}
+
+.file-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 4px 0;
+}
+
+.file-row code {
+    font-size: 12px;
 }
 
 .chart-container {
