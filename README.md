@@ -9,6 +9,8 @@ Standalone temperature + humidity data logger with an onboard web UI.
 
 ![Web Interface Screenshot](screenshot.png)
 
+*Web UI: per-sensor live status, temperature/humidity charts (50 points), and chunked CSV download.*
+
 ## Features
 
 - **Access Point mode** (default): device creates its own WiFi network
