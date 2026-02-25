@@ -4004,7 +4004,8 @@ void setup() {
 
   // Serve static assets from LittleFS — MUST be after all server.on() routes
   // so that /api/* and other explicit handlers take priority over the catch-all.
-  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html").setCacheControl("max-age=86400");
+  // Prefer uncompressed files so Safari (and strict clients) can decode; gzip can cause "cannot decode raw data".
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html").setCacheControl("max-age=86400").setTryGzipFirst(false);
   
   server.begin();
   Serial.println("Async web server started on port 80");

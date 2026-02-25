@@ -43,6 +43,7 @@
                 <button onclick="loadData()" class="btn-primary">Load</button>
                 <button onclick="toggleAutoRefresh()" id="autoRefreshBtn" class="btn-secondary">Auto: Off</button>
                 <button onclick="openStorageManager()" class="btn-secondary">Storage</button>
+                <!-- Fun mode removed -->
                 <span id="wsStatus" class="status-badge">WS: --</span>
                 <span id="dataCount" class="data-count">0 points</span>
             </div>
@@ -62,14 +63,16 @@
                     <span class="sensor-options-num">Sensor 0</span>
                     <span class="sensor-options-label">Sampling:</span>
                     <select id="sensor0Sampling" onchange="saveSensorSampling(0)">
-                        <option value="10">10 s</option>
-                        <option value="30">30 s</option>
-                        <option value="60">1 min</option>
-                        <option value="300">5 min</option>
                         <option value="600">10 min</option>
-                        <option value="3600" selected>1 h</option>
-                        <option value="21600">6 h</option>
-                        <option value="86400">24 h</option>
+                        <option value="1200">20 min</option>
+                        <option value="1800">30 min</option>
+                        <option value="3600" selected>1 hour</option>
+                        <option value="7200">2 hours</option>
+                        <option value="14400">4 hours</option>
+                        <option value="21600">6 hours</option>
+                        <option value="28800">8 hours</option>
+                        <option value="43200">12 hours</option>
+                        <option value="86400">24 hours</option>
                     </select>
                     <span class="sensor-options-label">Heating:</span>
                     <select id="sensor0HeatingMode" onchange="saveSensorHeatingMode(0)">
@@ -78,7 +81,6 @@
                         <option value="1min_1hr">1 min every 60 min</option>
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <button type="button" onclick="downloadCSV(0)" class="btn-small">Download CSV</button>
                     <button type="button" onclick="downloadAllSensor(0)" class="btn-small btn-strong">Download ALL (S0)</button>
                 </div>
             </div>
@@ -95,14 +97,16 @@
                     <span class="sensor-options-num">Sensor 1</span>
                     <span class="sensor-options-label">Sampling:</span>
                     <select id="sensor1Sampling" onchange="saveSensorSampling(1)">
-                        <option value="10">10 s</option>
-                        <option value="30">30 s</option>
-                        <option value="60">1 min</option>
-                        <option value="300">5 min</option>
                         <option value="600">10 min</option>
-                        <option value="3600" selected>1 h</option>
-                        <option value="21600">6 h</option>
-                        <option value="86400">24 h</option>
+                        <option value="1200">20 min</option>
+                        <option value="1800">30 min</option>
+                        <option value="3600" selected>1 hour</option>
+                        <option value="7200">2 hours</option>
+                        <option value="14400">4 hours</option>
+                        <option value="21600">6 hours</option>
+                        <option value="28800">8 hours</option>
+                        <option value="43200">12 hours</option>
+                        <option value="86400">24 hours</option>
                     </select>
                     <span class="sensor-options-label">Heating:</span>
                     <select id="sensor1HeatingMode" onchange="saveSensorHeatingMode(1)">
@@ -111,7 +115,6 @@
                         <option value="1min_1hr">1 min every 60 min</option>
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <button type="button" onclick="downloadCSV(1)" class="btn-small">Download CSV</button>
                     <button type="button" onclick="downloadAllSensor(1)" class="btn-small btn-strong">Download ALL (S1)</button>
                 </div>
             </div>
@@ -128,14 +131,16 @@
                     <span class="sensor-options-num">Sensor 2</span>
                     <span class="sensor-options-label">Sampling:</span>
                     <select id="sensor2Sampling" onchange="saveSensorSampling(2)">
-                        <option value="10">10 s</option>
-                        <option value="30">30 s</option>
-                        <option value="60">1 min</option>
-                        <option value="300">5 min</option>
                         <option value="600">10 min</option>
-                        <option value="3600" selected>1 h</option>
-                        <option value="21600">6 h</option>
-                        <option value="86400">24 h</option>
+                        <option value="1200">20 min</option>
+                        <option value="1800">30 min</option>
+                        <option value="3600" selected>1 hour</option>
+                        <option value="7200">2 hours</option>
+                        <option value="14400">4 hours</option>
+                        <option value="21600">6 hours</option>
+                        <option value="28800">8 hours</option>
+                        <option value="43200">12 hours</option>
+                        <option value="86400">24 hours</option>
                     </select>
                     <span class="sensor-options-label">Heating:</span>
                     <select id="sensor2HeatingMode" onchange="saveSensorHeatingMode(2)">
@@ -144,7 +149,6 @@
                         <option value="1min_1hr">1 min every 60 min</option>
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <button type="button" onclick="downloadCSV(2)" class="btn-small">Download CSV</button>
                     <button type="button" onclick="downloadAllSensor(2)" class="btn-small btn-strong">Download ALL (S2)</button>
                 </div>
             </div>
@@ -161,14 +165,16 @@
                     <span class="sensor-options-num">Sensor 3</span>
                     <span class="sensor-options-label">Sampling:</span>
                     <select id="sensor3Sampling" onchange="saveSensorSampling(3)">
-                        <option value="10">10 s</option>
-                        <option value="30">30 s</option>
-                        <option value="60">1 min</option>
-                        <option value="300">5 min</option>
                         <option value="600">10 min</option>
-                        <option value="3600" selected>1 h</option>
-                        <option value="21600">6 h</option>
-                        <option value="86400">24 h</option>
+                        <option value="1200">20 min</option>
+                        <option value="1800">30 min</option>
+                        <option value="3600" selected>1 hour</option>
+                        <option value="7200">2 hours</option>
+                        <option value="14400">4 hours</option>
+                        <option value="21600">6 hours</option>
+                        <option value="28800">8 hours</option>
+                        <option value="43200">12 hours</option>
+                        <option value="86400">24 hours</option>
                     </select>
                     <span class="sensor-options-label">Heating:</span>
                     <select id="sensor3HeatingMode" onchange="saveSensorHeatingMode(3)">
@@ -177,7 +183,6 @@
                         <option value="1min_1hr">1 min every 60 min</option>
                         <option value="1min_1day">1 min every 24 h</option>
                     </select>
-                    <button type="button" onclick="downloadCSV(3)" class="btn-small">Download CSV</button>
                     <button type="button" onclick="downloadAllSensor(3)" class="btn-small btn-strong">Download ALL (S3)</button>
                 </div>
             </div>

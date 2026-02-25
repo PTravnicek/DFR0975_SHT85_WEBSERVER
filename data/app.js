@@ -153,6 +153,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Auto-refresh is OFF by default (WS live updates should keep charts moving).
     // User can toggle Auto: 1s or Auto: 30s.
     stopAutoRefresh();
+
 });
 
 // Live status update
@@ -552,7 +553,7 @@ function ensurePerSensorConfig() {
     }
 }
 
-const SAMPLING_OPTIONS = [10, 30, 60, 300, 600, 3600, 21600, 86400];
+const SAMPLING_OPTIONS = [600, 1200, 1800, 3600, 7200, 14400, 21600, 28800, 43200, 86400]; // 10min .. 24h
 
 function closestSamplingOption(sec) {
     if (SAMPLING_OPTIONS.indexOf(sec) >= 0) return sec;
@@ -1121,6 +1122,8 @@ function downloadAllSensor(sensorIndex) {
     // LittleFS export endpoint: streams full-history per-sensor CSV.
     window.location.href = `/api/lfs/export?sensor=${idx}`;
 }
+
+// (fun mode removed)
 
 // ---- Storage Manager UI ----
 function openStorageManager() {
